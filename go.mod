@@ -1,3 +1,3 @@
-module github.com/traefik/plugindemo
+module github.com/bartlett-ops/sphinx
 
 go 1.19

@@ -1,6 +1,6 @@
 This repository includes an example plugin, `demo`, for you to use as a reference for developing your own plugins.
 
-[![Build Status](https://github.com/traefik/plugindemo/workflows/Main/badge.svg?branch=master)](https://github.com/traefik/plugindemo/actions)
+[![Build Status](https://github.com/bartlett-ops/sphinx/workflows/Main/badge.svg?branch=master)](https://github.com/bartlett-ops/sphinx/actions)
 
 The existing plugins can be browsed into the [Plugin Catalog](https://plugins.traefik.io).
 
@@ -39,8 +39,8 @@ The following declaration (given here in YAML) defines a plugin:
 experimental:
   plugins:
     example:
-      moduleName: github.com/traefik/plugindemo
-      version: v0.2.1
+      moduleName: github.com/bartlett-ops/sphinx
+      version: master
 ```
 
 Here is an example of a file provider dynamic configuration (given here in YAML), where the interesting part is the `http.middlewares` section:
@@ -85,8 +85,8 @@ The source code of the plugin should be organized as follows:
 ./plugins-local/
     └── src
         └── github.com
-            └── traefik
-                └── plugindemo
+            └── bartlett-ops
+                └── sphinx
                     ├── demo.go
                     ├── demo_test.go
                     ├── go.mod
@@ -101,10 +101,10 @@ The source code of the plugin should be organized as follows:
 experimental:
   localPlugins:
     example:
-      moduleName: github.com/traefik/plugindemo
+      moduleName: github.com/bartlett-ops/sphinx
 ```
 
-(In the above example, the `plugindemo` plugin will be loaded from the path `./plugins-local/src/github.com/traefik/plugindemo`.)
+(In the above example, the `plugindemo` plugin will be loaded from the path `./plugins-local/src/github.com/bartlett-ops/sphinx`.)
 
 ```yaml
 # Dynamic configuration
