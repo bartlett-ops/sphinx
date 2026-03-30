@@ -18,3 +18,8 @@ vendor:
 
 clean:
 	rm -rf ./vendor
+
+deploy:
+	kubectl create configmap plugin-sphinx -n kube-system --from-file=./ -o yaml --dry-run=client | kubectl apply -f -
+	kubectl rollout restart -n kube-system deployment/traefik
+	kubectl rollout status -n kube-system deployment/traefik
