@@ -1,7 +1,10 @@
 package main
 
 import (
+	"flag"
+	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 )
@@ -14,11 +17,24 @@ type user struct {
 var users = make(map[string]user)
 
 func main() {
+	port := flag.Int("port", 8080, "Port to run server on")
+	trustedProxiesRaw := flag.String("trusted-proxies", "", "Comma separated list of trusted proxies in CIDR format")
+	flag.Parse()
+
+	var trustedProxies []string
+
+	if *trustedProxiesRaw != "" {
+		trustedProxies = strings.Split(*trustedProxiesRaw, ",")
+	}
+
+	println(fmt.Sprintf("length trusted proxies: %d", len(trustedProxies)))
+
 	router := gin.Default()
+	router.SetTrustedProxies(trustedProxies)
 	router.GET("/users", getUsers)
 	router.POST("/users", postUsers)
 
-	router.Run("localhost:8080")
+	router.Run(fmt.Sprintf(":%d", *port))
 }
 
 func addUser(u user) {
@@ -32,7 +48,7 @@ func getUsers(c *gin.Context) {
 
 // postAlbums adds an album from JSON received in the request body.
 func postUsers(c *gin.Context) {
-	requiredHeaders := []string{"X-User-Email", "X-Forwarded-For"}
+	requiredHeaders := []string{"X-User-Email"}
 
 	missing := []string{}
 
@@ -52,7 +68,7 @@ func postUsers(c *gin.Context) {
 
 	user := user{
 		Email: c.Request.Header.Get("X-User-Email"),
-		IP:    c.Request.Header.Get("X-Forwarded-For"),
+		IP:    c.ClientIP(),
 	}
 
 	addUser(user)
