@@ -13,6 +13,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/tools/clientcmd"
@@ -27,11 +28,11 @@ var (
 	users         = make(map[string]user)
 	dynClient     *dynamic.DynamicClient
 	middlewareGVR = schema.GroupVersionResource{
-		Group:    "traefik.containo.us",
+		Group:    "traefik.io",
 		Version:  "v1alpha1",
 		Resource: "middlewares",
 	}
-	middleware *unstructured.Unstructured
+	middleware *Middleware
 )
 
 func main() {
@@ -47,7 +48,7 @@ func main() {
 		trustedProxies = strings.Split(*trustedProxiesRaw, ",")
 	}
 	if *middlewareName == "" {
-		fmt.Println("Error: middleware-name not set")
+		log.Printf("Error: middleware-name not set")
 		os.Exit(1)
 	}
 
@@ -67,8 +68,8 @@ func main() {
 		log.Fatal(err)
 	}
 
-	ips, _, _ := unstructured.NestedStringSlice(middleware.Object, "spec", "ipAllowList", "sourceRange")
-	fmt.Println("Current allowlist:", ips)
+	ips := middleware.Spec.IPAllowList.SourceRange
+	log.Printf("Current allowlist: %v", ips)
 
 	router := gin.Default()
 	router.SetTrustedProxies(trustedProxies)
@@ -78,41 +79,59 @@ func main() {
 	router.Run(fmt.Sprintf(":%d", *port))
 }
 
-func getOrCreateMiddleware(name *string, namespace *string) (*unstructured.Unstructured, error) {
-	var middleware *unstructured.Unstructured
+func getOrCreateMiddleware(name *string, namespace *string) (*Middleware, error) {
+	var middleware *Middleware
 	var err error
-	middleware, err = dynClient.Resource(middlewareGVR).Namespace(*namespace).Get(context.TODO(), *name, metav1.GetOptions{})
+	u, err := dynClient.Resource(middlewareGVR).Namespace(*namespace).Get(context.TODO(), *name, metav1.GetOptions{})
 	if err != nil {
 		if errors.IsNotFound(err) {
-			middleware = &unstructured.Unstructured{
-				Object: map[string]any{
-					"apiVersion": fmt.Sprintf("%s/%s", middlewareGVR.Group, middlewareGVR.Version),
-					"kind":       "Middleware",
-					"metadata": map[string]any{
-						"name":      name,
-						"namespace": namespace,
-					},
-					"spec": map[string]any{
-						// Example spec: add your configuration here
-						"ipAllowList": map[string]any{
-							"sourceRange": []string{},
-						},
-					},
-				},
+			middleware = NewMiddleware(*name, *namespace)
+			// write empty middleware
+			err = writeMiddleware(middleware)
+			if err != nil {
+				log.Printf("Failed to create new middleware: %v", middleware)
+				log.Printf(err.Error())
+			} else {
+				log.Printf("Created new middleware: %v", middleware)
 			}
 		}
-		err = nil
+	} else {
+		err = runtime.DefaultUnstructuredConverter.FromUnstructured(u.Object, &middleware)
+		if err != nil {
+			log.Printf("Conversion failed when reading middleware: %v", err)
+		}
 	}
 	return middleware, err
 }
 
-func addUser(u2 user) {
+func addUser(middleware *Middleware, u2 user) {
 	u1, exists := users[u2.Email]
 
 	if !exists || u1 != u2 {
 		users[u2.Email] = u2
-		// sync
+		writeMiddleware(middleware)
 	}
+}
+
+func getUnstructured(middleware *Middleware) (*unstructured.Unstructured, error) {
+	obj, err := runtime.DefaultUnstructuredConverter.ToUnstructured(middleware)
+	if err != nil {
+		log.Printf("conversion failed: %v", err)
+	}
+	return &unstructured.Unstructured{Object: obj}, err
+}
+
+func writeMiddleware(middleware *Middleware) error {
+	u, err := getUnstructured(middleware)
+	if err != nil {
+		log.Printf(err.Error())
+	}
+	_, err = dynClient.Resource(middlewareGVR).Namespace(middleware.Namespace).Update(context.TODO(), u, metav1.UpdateOptions{})
+	if err != nil {
+		log.Printf("Failed to write middleware: %v", middleware)
+		log.Printf(err.Error())
+	}
+	return err
 }
 
 func getUsers(c *gin.Context) {
@@ -131,7 +150,7 @@ func postUsers(c *gin.Context) {
 		IP:    c.ClientIP(),
 	}
 
-	addUser(user)
+	addUser(middleware, user)
 
 	c.IndentedJSON(http.StatusCreated, user)
 }
