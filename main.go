@@ -25,6 +25,7 @@ type user struct {
 }
 
 var (
+	// TODO write users to middleware
 	users         = make(map[string]user)
 	dynClient     *dynamic.DynamicClient
 	middlewareGVR = schema.GroupVersionResource{
@@ -89,8 +90,7 @@ func getOrCreateMiddleware(name *string, namespace *string) (*Middleware, error)
 			// write empty middleware
 			err = writeMiddleware(middleware)
 			if err != nil {
-				log.Printf("Failed to create new middleware: %v", middleware)
-				log.Printf(err.Error())
+				log.Printf("Failed to create new middleware: %v", err)
 			} else {
 				log.Printf("Created new middleware: %v", middleware)
 			}
@@ -104,13 +104,14 @@ func getOrCreateMiddleware(name *string, namespace *string) (*Middleware, error)
 	return middleware, err
 }
 
-func addUser(middleware *Middleware, u2 user) {
+func addUser(middleware *Middleware, u2 user) error {
 	u1, exists := users[u2.Email]
 
 	if !exists || u1 != u2 {
 		users[u2.Email] = u2
-		writeMiddleware(middleware)
+		return writeMiddleware(middleware)
 	}
+	return nil
 }
 
 func getUnstructured(middleware *Middleware) (*unstructured.Unstructured, error) {
@@ -122,14 +123,15 @@ func getUnstructured(middleware *Middleware) (*unstructured.Unstructured, error)
 }
 
 func writeMiddleware(middleware *Middleware) error {
-	u, err := getUnstructured(middleware)
+	_, err := getMiddleware(middleware)
 	if err != nil {
-		log.Printf(err.Error())
-	}
-	_, err = dynClient.Resource(middlewareGVR).Namespace(middleware.Namespace).Update(context.TODO(), u, metav1.UpdateOptions{})
-	if err != nil {
-		log.Printf("Failed to write middleware: %v", middleware)
-		log.Printf(err.Error())
+		if errors.IsNotFound(err) {
+			err = createMiddleware(middleware)
+		} else {
+			log.Printf("Failed to check for existing middleware: %v", err)
+		}
+	} else {
+		err = updateMiddleware(middleware)
 	}
 	return err
 }
@@ -150,7 +152,15 @@ func postUsers(c *gin.Context) {
 		IP:    c.ClientIP(),
 	}
 
-	addUser(middleware, user)
+	err := addUser(middleware, user)
+	if err != nil {
+		log.Println("Failed to add user")
+		c.JSON(400, gin.H{
+			"error": "Failed to add user",
+		})
+	} else {
+		log.Println("Added user")
+	}
 
 	c.IndentedJSON(http.StatusCreated, user)
 }
