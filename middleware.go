@@ -2,14 +2,13 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"log"
 	"time"
 
-	jsonpatch "github.com/evanphx/json-patch/v5"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 )
 
 type Middleware struct {
@@ -57,12 +56,28 @@ func NewMiddleware(name, namespace string) *Middleware {
 	}
 }
 
-func getMiddleware(middleware *Middleware) (*unstructured.Unstructured, error) {
-	u, err := dynClient.Resource(middlewareGVR).Namespace(middleware.Metadata.Namespace).Get(context.TODO(), middleware.Metadata.Name, metav1.GetOptions{})
+func getOrCreateMiddleware(name *string, namespace *string) (*Middleware, error) {
+	var middleware *Middleware
+	var err error
+	u, err := dynClient.Resource(middlewareGVR).Namespace(*namespace).Get(context.TODO(), *name, metav1.GetOptions{})
 	if err != nil {
-		log.Printf("Failed to get middleware: %v", err)
+		if errors.IsNotFound(err) {
+			middleware = NewMiddleware(*name, *namespace)
+			// write empty middleware
+			err = createMiddleware(middleware)
+			if err != nil {
+				log.Printf("Failed to create new middleware: %v", err)
+			} else {
+				log.Printf("Created new middleware: %v", middleware)
+			}
+		}
+	} else {
+		err = runtime.DefaultUnstructuredConverter.FromUnstructured(u.Object, &middleware)
+		if err != nil {
+			log.Printf("Conversion failed when reading middleware: %v", err)
+		}
 	}
-	return u, err
+	return middleware, err
 }
 
 func createMiddleware(middleware *Middleware) error {
@@ -75,46 +90,54 @@ func createMiddleware(middleware *Middleware) error {
 	return err
 }
 
-func mergeUnstructured(u1, u2 *unstructured.Unstructured) error {
-	j1, _ := json.Marshal(u1.Object)
-	j2, _ := json.Marshal(u2.Object)
-	patch, _ := jsonpatch.CreateMergePatch(j1, j2)
-	mergedJSON, _ := jsonpatch.MergePatch(j1, patch)
-
-	var merged map[string]any
-	err := json.Unmarshal(mergedJSON, &merged)
-	if err != nil {
-		log.Printf("Failed to merge objects: %v", err)
-		return err
-	}
-
-	u1.Object = merged
-	return nil
+func mutate(middleware *unstructured.Unstructured, ips []string) error {
+	return unstructured.SetNestedStringSlice(middleware.Object, ips, "spec", "ipAllowList", "sourceRange")
 }
 
-func updateMiddleware(middleware *Middleware) error {
+func updateMiddleware(name *string, namespace *string, ips []string) error {
+	middleware, err := getOrCreateMiddleware(name, namespace)
+	if err != nil {
+		log.Printf("Failed to obtain middleware: %v", err)
+		return err
+	}
 	u, _ := getUnstructured(middleware)
-	liveMiddleware, err := getMiddleware(middleware)
-	if err != nil {
-		log.Printf("Failed to get live middleware")
-		return err
-	}
-	err = mergeUnstructured(u, liveMiddleware)
-	if err != nil {
-		return err
-	}
 
-	_, err = dynClient.Resource(middlewareGVR).Namespace(middleware.Metadata.Namespace).Update(context.TODO(), u, metav1.UpdateOptions{})
+	err = mutate(u, ips)
 	if err != nil {
-		if errors.IsConflict(err) {
-			log.Printf("Resource conflict, retrying")
-			time.Sleep(2 * time.Second)
-			err = updateMiddleware(middleware)
+		log.Printf("Failed to mutate middleware: %v", err)
+		return err
+	}
+	const maxRetries = 5
+	for range maxRetries {
+		_, err = dynClient.Resource(middlewareGVR).Namespace(middleware.Metadata.Namespace).Update(context.TODO(), u, metav1.UpdateOptions{})
+		if err != nil {
+			if errors.IsConflict(err) {
+				log.Printf(err.Error())
+				log.Printf("Resource conflict, retrying")
+				time.Sleep(2 * time.Second)
+				continue
+			} else {
+				log.Printf("Failed to update middleware: %v", err)
+				break
+			}
 		} else {
-			log.Printf("Failed to update middleware: %v", err)
+			log.Printf("Updated middleware")
+			break
 		}
-	} else {
-		log.Printf("Updated middleware")
 	}
 	return err
 }
+
+//func writeMiddleware(middleware *Middleware) error {
+//	_, err := getMiddleware(middleware)
+//	if err != nil {
+//		if errors.IsNotFound(err) {
+//			err = createMiddleware(middleware)
+//		} else {
+//			log.Printf("Failed to check for existing middleware: %v", err)
+//		}
+//	} else {
+//		err = updateMiddleware(middleware)
+//	}
+//	return err
+//}

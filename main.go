@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -10,8 +9,6 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
-	"k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -33,14 +30,15 @@ var (
 		Version:  "v1alpha1",
 		Resource: "middlewares",
 	}
-	middleware *Middleware
+	middlewareName      *string
+	middlewareNamespace *string
 )
 
 func main() {
 	port := flag.Int("port", 8080, "Port to run server on")
 	trustedProxiesRaw := flag.String("trusted-proxies", "", "Comma separated list of trusted proxies in CIDR format")
-	middlewareName := flag.String("middleware-name", "", "Name of allowlist middleware")
-	middlewareNamespace := flag.String("middleware-namespace", "kube-system", "Namespace of middleware")
+	middlewareName = flag.String("middleware-name", "", "Name of allowlist middleware")
+	middlewareNamespace = flag.String("middleware-namespace", "kube-system", "Namespace of middleware")
 	flag.Parse()
 
 	var trustedProxies []string
@@ -64,7 +62,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	middleware, err = getOrCreateMiddleware(middlewareName, middlewareNamespace)
+	middleware, err := getOrCreateMiddleware(middlewareName, middlewareNamespace)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -80,36 +78,24 @@ func main() {
 	router.Run(fmt.Sprintf(":%d", *port))
 }
 
-func getOrCreateMiddleware(name *string, namespace *string) (*Middleware, error) {
-	var middleware *Middleware
-	var err error
-	u, err := dynClient.Resource(middlewareGVR).Namespace(*namespace).Get(context.TODO(), *name, metav1.GetOptions{})
-	if err != nil {
-		if errors.IsNotFound(err) {
-			middleware = NewMiddleware(*name, *namespace)
-			// write empty middleware
-			err = writeMiddleware(middleware)
-			if err != nil {
-				log.Printf("Failed to create new middleware: %v", err)
-			} else {
-				log.Printf("Created new middleware: %v", middleware)
-			}
-		}
-	} else {
-		err = runtime.DefaultUnstructuredConverter.FromUnstructured(u.Object, &middleware)
-		if err != nil {
-			log.Printf("Conversion failed when reading middleware: %v", err)
-		}
-	}
-	return middleware, err
-}
-
-func addUser(middleware *Middleware, u2 user) error {
+func addUser(u2 user) error {
 	u1, exists := users[u2.Email]
 
 	if !exists || u1 != u2 {
 		users[u2.Email] = u2
-		return writeMiddleware(middleware)
+
+		// Create set to ensure no duplicates
+		set := make(map[string]struct{})
+		for _, v := range users {
+			set[v.IP] = struct{}{}
+		}
+
+		// Convert set to slice
+		ips := make([]string, 0, len(set))
+		for k := range set {
+			ips = append(ips, k)
+		}
+		return updateMiddleware(middlewareName, middlewareNamespace, ips)
 	}
 	return nil
 }
@@ -120,20 +106,6 @@ func getUnstructured(middleware *Middleware) (*unstructured.Unstructured, error)
 		log.Printf("conversion failed: %v", err)
 	}
 	return &unstructured.Unstructured{Object: obj}, err
-}
-
-func writeMiddleware(middleware *Middleware) error {
-	_, err := getMiddleware(middleware)
-	if err != nil {
-		if errors.IsNotFound(err) {
-			err = createMiddleware(middleware)
-		} else {
-			log.Printf("Failed to check for existing middleware: %v", err)
-		}
-	} else {
-		err = updateMiddleware(middleware)
-	}
-	return err
 }
 
 func getUsers(c *gin.Context) {
@@ -152,7 +124,7 @@ func postUsers(c *gin.Context) {
 		IP:    c.ClientIP(),
 	}
 
-	err := addUser(middleware, user)
+	err := addUser(user)
 	if err != nil {
 		log.Println("Failed to add user")
 		c.JSON(400, gin.H{
