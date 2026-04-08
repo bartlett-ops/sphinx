@@ -64,30 +64,30 @@ func getOrCreateMiddleware(name *string, namespace *string) (*Middleware, error)
 		if errors.IsNotFound(err) {
 			middleware = NewMiddleware(*name, *namespace)
 			// write empty middleware
-			err = createMiddleware(middleware)
+			u, err = createMiddleware(middleware)
 			if err != nil {
 				log.Printf("Failed to create new middleware: %v", err)
+				return nil, err
 			} else {
 				log.Printf("Created new middleware: %v", middleware)
 			}
 		}
-	} else {
-		err = runtime.DefaultUnstructuredConverter.FromUnstructured(u.Object, &middleware)
-		if err != nil {
-			log.Printf("Conversion failed when reading middleware: %v", err)
-		}
+	}
+	err = runtime.DefaultUnstructuredConverter.FromUnstructured(u.Object, &middleware)
+	if err != nil {
+		log.Printf("Conversion failed when reading middleware: %v", err)
 	}
 	return middleware, err
 }
 
-func createMiddleware(middleware *Middleware) error {
+func createMiddleware(middleware *Middleware) (*unstructured.Unstructured, error) {
 	u, _ := getUnstructured(middleware)
 	unstructured.RemoveNestedField(u.Object, "metadata", "resourceVersion")
-	_, err := dynClient.Resource(middlewareGVR).Namespace(middleware.Metadata.Namespace).Create(context.TODO(), u, metav1.CreateOptions{})
+	u2, err := dynClient.Resource(middlewareGVR).Namespace(middleware.Metadata.Namespace).Create(context.TODO(), u, metav1.CreateOptions{})
 	if err != nil {
 		log.Printf("Failed to create new middleware: %v", err)
 	}
-	return err
+	return u2, err
 }
 
 func mutate(middleware *unstructured.Unstructured, ips []string) error {
