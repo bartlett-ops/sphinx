@@ -13,9 +13,9 @@ import (
 
 type Middleware struct {
 	metav1.TypeMeta `json:",inline"`
-	Metadata        Metadata `json:"metadata"`
 
-	Spec MiddlewareSpec `json:"spec"`
+	Metadata Metadata       `json:"metadata"`
+	Spec     MiddlewareSpec `json:"spec"`
 }
 
 type Metadata struct {
