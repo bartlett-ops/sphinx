@@ -110,6 +110,16 @@ func addUser(u2 user) error {
 	return updateMiddleware(middlewareName, middlewareNamespace, ips)
 }
 
+func resolveClientIP(c *gin.Context) string {
+	if xff := c.GetHeader("X-Forwarded-For"); xff != "" {
+		if i := strings.IndexByte(xff, ','); i != -1 {
+			return strings.TrimSpace(xff[:i])
+		}
+		return strings.TrimSpace(xff)
+	}
+	return c.ClientIP()
+}
+
 func getIPsFromUsers() []string {
 	set := make(map[string]struct{})
 	for _, v := range users {
@@ -146,7 +156,7 @@ func postUsers(c *gin.Context) {
 	}
 	user := user{
 		Email: email,
-		IP:    c.ClientIP(),
+		IP:    resolveClientIP(c),
 	}
 
 	if err := addUser(user); err != nil {
