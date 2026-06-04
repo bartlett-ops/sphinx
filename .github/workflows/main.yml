@@ -7,12 +7,11 @@ on:
   pull_request:
 
 jobs:
-
   main:
     name: Main Process
     runs-on: ubuntu-latest
     env:
-      GO_VERSION: 1.19
+      GO_VERSION: 1.25.8
       GOLANGCI_LINT_VERSION: v1.50.0
       YAEGI_VERSION: v0.14.2
       CGO_ENABLED: 0
@@ -21,7 +20,6 @@ jobs:
         working-directory: ${{ github.workspace }}/go/src/github.com/${{ github.repository }}
 
     steps:
-
       # https://github.com/marketplace/actions/setup-go-environment
       - name: Set up Go ${{ env.GO_VERSION }}
         uses: actions/setup-go@v2
