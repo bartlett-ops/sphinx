@@ -26,13 +26,19 @@ var (
 	usersMu             sync.RWMutex
 	users               = make(map[string]user)
 	dynClient           *dynamic.DynamicClient
-	middlewareGVR = schema.GroupVersionResource{
+	middlewareGVR       = schema.GroupVersionResource{
 		Group:    "traefik.io",
 		Version:  "v1alpha1",
 		Resource: "middlewares",
 	}
+	configMapGVR = schema.GroupVersionResource{
+		Group:    "",
+		Version:  "v1",
+		Resource: "configmaps",
+	}
 	middlewareName      *string
 	middlewareNamespace *string
+	configMapName       *string
 )
 
 func main() {
@@ -40,6 +46,7 @@ func main() {
 	trustedProxiesRaw := flag.String("trusted-proxies", "", "Comma separated list of trusted proxies in CIDR format")
 	middlewareName = flag.String("middleware-name", "", "Name of allowlist middleware")
 	middlewareNamespace = flag.String("middleware-namespace", "kube-system", "Namespace of middleware")
+	configMapName = flag.String("configmap-name", "sphinx-users", "Name of ConfigMap for user persistence")
 	flag.Parse()
 
 	var trustedProxies []string
@@ -63,12 +70,19 @@ func main() {
 		log.Fatal(err)
 	}
 
-	middleware, err := getOrCreateMiddleware(middlewareName, middlewareNamespace)
-	if err != nil {
+	if _, err = getOrCreateMiddleware(middlewareName, middlewareNamespace); err != nil {
 		log.Fatal(err)
 	}
 
-	ips := middleware.Spec.IPAllowList.SourceRange
+	if err = loadUsers(); err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("Loaded %d users", len(users))
+
+	ips := getIPsFromUsers()
+	if err = updateMiddleware(middlewareName, middlewareNamespace, ips); err != nil {
+		log.Fatalf("Failed to sync middleware on startup: %v", err)
+	}
 	log.Printf("Current allowlist: %v", ips)
 
 	router := gin.Default()
@@ -90,6 +104,9 @@ func addUser(u2 user) error {
 	ips := getIPsFromUsers()
 	usersMu.Unlock()
 
+	if err := saveUsers(); err != nil {
+		return err
+	}
 	return updateMiddleware(middlewareName, middlewareNamespace, ips)
 }
 

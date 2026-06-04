@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"time"
@@ -94,6 +95,58 @@ func createMiddleware(middleware *Middleware) (*unstructured.Unstructured, error
 
 func mutate(middleware *unstructured.Unstructured, ips []string) error {
 	return unstructured.SetNestedStringSlice(middleware.Object, ips, "spec", "ipAllowList", "sourceRange")
+}
+
+func loadUsers() error {
+	u, err := dynClient.Resource(configMapGVR).Namespace(*middlewareNamespace).Get(context.TODO(), *configMapName, metav1.GetOptions{})
+	if err != nil {
+		if errors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	data, found, err := unstructured.NestedString(u.Object, "data", "users")
+	if err != nil || !found || data == "" {
+		return err
+	}
+	return json.Unmarshal([]byte(data), &users)
+}
+
+func saveUsers() error {
+	usersMu.RLock()
+	data, err := json.Marshal(users)
+	usersMu.RUnlock()
+	if err != nil {
+		return err
+	}
+
+	existing, err := dynClient.Resource(configMapGVR).Namespace(*middlewareNamespace).Get(context.TODO(), *configMapName, metav1.GetOptions{})
+	if err != nil {
+		if !errors.IsNotFound(err) {
+			return err
+		}
+		cm := &unstructured.Unstructured{
+			Object: map[string]interface{}{
+				"apiVersion": "v1",
+				"kind":       "ConfigMap",
+				"metadata": map[string]interface{}{
+					"name":      *configMapName,
+					"namespace": *middlewareNamespace,
+				},
+				"data": map[string]interface{}{
+					"users": string(data),
+				},
+			},
+		}
+		_, err = dynClient.Resource(configMapGVR).Namespace(*middlewareNamespace).Create(context.TODO(), cm, metav1.CreateOptions{})
+		return err
+	}
+
+	if err = unstructured.SetNestedField(existing.Object, string(data), "data", "users"); err != nil {
+		return err
+	}
+	_, err = dynClient.Resource(configMapGVR).Namespace(*middlewareNamespace).Update(context.TODO(), existing, metav1.UpdateOptions{})
+	return err
 }
 
 func updateMiddleware(name *string, namespace *string, ips []string) error {
