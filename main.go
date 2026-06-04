@@ -10,6 +10,7 @@ import (
 	"sync"
 
 	"github.com/gin-gonic/gin"
+	"github.com/peterbourgon/ff/v3"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -47,7 +48,9 @@ func main() {
 	middlewareName = flag.String("middleware-name", "", "Name of allowlist middleware")
 	middlewareNamespace = flag.String("middleware-namespace", "kube-system", "Namespace of middleware")
 	configMapName = flag.String("configmap-name", "sphinx-users", "Name of ConfigMap for user persistence")
-	flag.Parse()
+	if err := ff.Parse(flag.CommandLine, os.Args[1:], ff.WithEnvVarPrefix("SPHINX")); err != nil {
+		log.Fatal(err)
+	}
 
 	var trustedProxies []string
 
