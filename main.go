@@ -84,20 +84,24 @@ func addUser(u2 user) error {
 	if !exists || u1 != u2 {
 		users[u2.Email] = u2
 
-		// Create set to ensure no duplicates
-		set := make(map[string]struct{})
-		for _, v := range users {
-			set[v.IP] = struct{}{}
-		}
-
-		// Convert set to slice
-		ips := make([]string, 0, len(set))
-		for k := range set {
-			ips = append(ips, k)
-		}
-		return updateMiddleware(middlewareName, middlewareNamespace, ips)
+		return updateMiddleware(middlewareName, middlewareNamespace, getIPsFromUsers())
 	}
 	return nil
+}
+
+func getIPsFromUsers() []string {
+	// Create set to ensure no duplicates
+	set := make(map[string]struct{})
+	for _, v := range users {
+		set[v.IP] = struct{}{}
+	}
+
+	// Convert set to slice
+	ips := make([]string, 0, len(set))
+	for k := range set {
+		ips = append(ips, k)
+	}
+	return ips
 }
 
 func getUnstructured(middleware *Middleware) (*unstructured.Unstructured, error) {
