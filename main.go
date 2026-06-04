@@ -40,6 +40,7 @@ var (
 	middlewareName      *string
 	middlewareNamespace *string
 	configMapName       *string
+	instanceID          string
 )
 
 func main() {
@@ -61,6 +62,12 @@ func main() {
 		log.Printf("Error: middleware-name not set")
 		os.Exit(1)
 	}
+
+	hostname, err := os.Hostname()
+	if err != nil {
+		log.Fatal(err)
+	}
+	instanceID = hostname
 
 	config, err := clientcmd.BuildConfigFromFlags("", "/home/tom/.kube/config")
 	if err != nil {

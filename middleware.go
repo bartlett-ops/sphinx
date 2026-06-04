@@ -11,6 +11,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 type Middleware struct {
@@ -93,8 +94,24 @@ func createMiddleware(middleware *Middleware) (*unstructured.Unstructured, error
 	return u2, err
 }
 
-func mutate(middleware *unstructured.Unstructured, ips []string) error {
-	return unstructured.SetNestedStringSlice(middleware.Object, ips, "spec", "ipAllowList", "sourceRange")
+func mutate(u *unstructured.Unstructured, ips []string) error {
+	existing, _, _ := unstructured.NestedStringSlice(u.Object, "spec", "ipAllowList", "sourceRange")
+	return unstructured.SetNestedStringSlice(u.Object, unionStrings(existing, ips), "spec", "ipAllowList", "sourceRange")
+}
+
+func unionStrings(a, b []string) []string {
+	seen := make(map[string]struct{}, len(a)+len(b))
+	for _, v := range a {
+		seen[v] = struct{}{}
+	}
+	for _, v := range b {
+		seen[v] = struct{}{}
+	}
+	result := make([]string, 0, len(seen))
+	for k := range seen {
+		result = append(result, k)
+	}
+	return result
 }
 
 func loadUsers() error {
@@ -105,7 +122,7 @@ func loadUsers() error {
 		}
 		return err
 	}
-	data, found, err := unstructured.NestedString(u.Object, "data", "users")
+	data, found, err := unstructured.NestedString(u.Object, "data", instanceID)
 	if err != nil || !found || data == "" {
 		return err
 	}
@@ -114,38 +131,37 @@ func loadUsers() error {
 
 func saveUsers() error {
 	usersMu.RLock()
-	data, err := json.Marshal(users)
+	userData, err := json.Marshal(users)
 	usersMu.RUnlock()
 	if err != nil {
 		return err
 	}
 
-	existing, err := dynClient.Resource(configMapGVR).Namespace(*middlewareNamespace).Get(context.TODO(), *configMapName, metav1.GetOptions{})
+	// Server-Side Apply: each instance owns only its own key in the ConfigMap data,
+	// keyed by instanceID (pod hostname). Instances never overwrite each other.
+	patch, err := json.Marshal(map[string]interface{}{
+		"apiVersion": "v1",
+		"kind":       "ConfigMap",
+		"metadata": map[string]interface{}{
+			"name":      *configMapName,
+			"namespace": *middlewareNamespace,
+		},
+		"data": map[string]interface{}{
+			instanceID: string(userData),
+		},
+	})
 	if err != nil {
-		if !errors.IsNotFound(err) {
-			return err
-		}
-		cm := &unstructured.Unstructured{
-			Object: map[string]interface{}{
-				"apiVersion": "v1",
-				"kind":       "ConfigMap",
-				"metadata": map[string]interface{}{
-					"name":      *configMapName,
-					"namespace": *middlewareNamespace,
-				},
-				"data": map[string]interface{}{
-					"users": string(data),
-				},
-			},
-		}
-		_, err = dynClient.Resource(configMapGVR).Namespace(*middlewareNamespace).Create(context.TODO(), cm, metav1.CreateOptions{})
 		return err
 	}
 
-	if err = unstructured.SetNestedField(existing.Object, string(data), "data", "users"); err != nil {
-		return err
-	}
-	_, err = dynClient.Resource(configMapGVR).Namespace(*middlewareNamespace).Update(context.TODO(), existing, metav1.UpdateOptions{})
+	force := true
+	_, err = dynClient.Resource(configMapGVR).Namespace(*middlewareNamespace).Patch(
+		context.TODO(),
+		*configMapName,
+		types.ApplyPatchType,
+		patch,
+		metav1.PatchOptions{FieldManager: "sphinx-" + instanceID, Force: &force},
+	)
 	return err
 }
 
