@@ -7,8 +7,10 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/gin-gonic/gin"
+	"github.com/peterbourgon/ff/v3"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -22,16 +24,23 @@ type user struct {
 }
 
 var (
-	// TODO write users to middleware
-	users         = make(map[string]user)
-	dynClient     *dynamic.DynamicClient
-	middlewareGVR = schema.GroupVersionResource{
+	usersMu             sync.RWMutex
+	users               = make(map[string]user)
+	dynClient           *dynamic.DynamicClient
+	middlewareGVR       = schema.GroupVersionResource{
 		Group:    "traefik.io",
 		Version:  "v1alpha1",
 		Resource: "middlewares",
 	}
+	configMapGVR = schema.GroupVersionResource{
+		Group:    "",
+		Version:  "v1",
+		Resource: "configmaps",
+	}
 	middlewareName      *string
 	middlewareNamespace *string
+	configMapName       *string
+	instanceID          string
 )
 
 func main() {
@@ -39,7 +48,10 @@ func main() {
 	trustedProxiesRaw := flag.String("trusted-proxies", "", "Comma separated list of trusted proxies in CIDR format")
 	middlewareName = flag.String("middleware-name", "", "Name of allowlist middleware")
 	middlewareNamespace = flag.String("middleware-namespace", "kube-system", "Namespace of middleware")
-	flag.Parse()
+	configMapName = flag.String("configmap-name", "sphinx-users", "Name of ConfigMap for user persistence")
+	if err := ff.Parse(flag.CommandLine, os.Args[1:], ff.WithEnvVarPrefix("SPHINX")); err != nil {
+		log.Fatal(err)
+	}
 
 	var trustedProxies []string
 
@@ -50,6 +62,12 @@ func main() {
 		log.Printf("Error: middleware-name not set")
 		os.Exit(1)
 	}
+
+	hostname, err := os.Hostname()
+	if err != nil {
+		log.Fatal(err)
+	}
+	instanceID = hostname
 
 	config, err := clientcmd.BuildConfigFromFlags("", "/home/tom/.kube/config")
 	if err != nil {
@@ -62,12 +80,19 @@ func main() {
 		log.Fatal(err)
 	}
 
-	middleware, err := getOrCreateMiddleware(middlewareName, middlewareNamespace)
-	if err != nil {
+	if _, err = getOrCreateMiddleware(middlewareName, middlewareNamespace); err != nil {
 		log.Fatal(err)
 	}
 
-	ips := middleware.Spec.IPAllowList.SourceRange
+	if err = loadUsers(); err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("Loaded %d users", len(users))
+
+	ips := getIPsFromUsers()
+	if err = updateMiddleware(middlewareName, middlewareNamespace, ips); err != nil {
+		log.Fatalf("Failed to sync middleware on startup: %v", err)
+	}
 	log.Printf("Current allowlist: %v", ips)
 
 	router := gin.Default()
@@ -79,24 +104,37 @@ func main() {
 }
 
 func addUser(u2 user) error {
+	usersMu.Lock()
 	u1, exists := users[u2.Email]
-
-	if !exists || u1 != u2 {
-		users[u2.Email] = u2
-
-		return updateMiddleware(middlewareName, middlewareNamespace, getIPsFromUsers())
+	if exists && u1 == u2 {
+		usersMu.Unlock()
+		return nil
 	}
-	return nil
+	users[u2.Email] = u2
+	ips := getIPsFromUsers()
+	usersMu.Unlock()
+
+	if err := saveUsers(); err != nil {
+		return err
+	}
+	return updateMiddleware(middlewareName, middlewareNamespace, ips)
+}
+
+func resolveClientIP(c *gin.Context) string {
+	if xff := c.GetHeader("X-Forwarded-For"); xff != "" {
+		if i := strings.IndexByte(xff, ','); i != -1 {
+			return strings.TrimSpace(xff[:i])
+		}
+		return strings.TrimSpace(xff)
+	}
+	return c.ClientIP()
 }
 
 func getIPsFromUsers() []string {
-	// Create set to ensure no duplicates
 	set := make(map[string]struct{})
 	for _, v := range users {
 		set[v.IP] = struct{}{}
 	}
-
-	// Convert set to slice
 	ips := make([]string, 0, len(set))
 	for k := range set {
 		ips = append(ips, k)
@@ -113,30 +151,31 @@ func getUnstructured(middleware *Middleware) (*unstructured.Unstructured, error)
 }
 
 func getUsers(c *gin.Context) {
+	usersMu.RLock()
+	defer usersMu.RUnlock()
 	c.IndentedJSON(http.StatusOK, users)
 }
 
 func postUsers(c *gin.Context) {
 	email := c.GetHeader("X-User-Email")
 	if email == "" {
-		c.JSON(400, gin.H{
+		c.JSON(http.StatusBadRequest, gin.H{
 			"error": "Missing X-User-Email header",
 		})
+		return
 	}
 	user := user{
 		Email: email,
-		IP:    c.ClientIP(),
+		IP:    resolveClientIP(c),
 	}
 
-	err := addUser(user)
-	if err != nil {
+	if err := addUser(user); err != nil {
 		log.Println("Failed to add user")
-		c.JSON(400, gin.H{
+		c.JSON(http.StatusInternalServerError, gin.H{
 			"error": "Failed to add user",
 		})
-	} else {
-		log.Println("Added user")
+		return
 	}
-
+	log.Println("Added user")
 	c.IndentedJSON(http.StatusCreated, user)
 }
