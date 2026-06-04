@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/gin-gonic/gin"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -22,9 +23,9 @@ type user struct {
 }
 
 var (
-	// TODO write users to middleware
-	users         = make(map[string]user)
-	dynClient     *dynamic.DynamicClient
+	usersMu             sync.RWMutex
+	users               = make(map[string]user)
+	dynClient           *dynamic.DynamicClient
 	middlewareGVR = schema.GroupVersionResource{
 		Group:    "traefik.io",
 		Version:  "v1alpha1",
@@ -79,24 +80,24 @@ func main() {
 }
 
 func addUser(u2 user) error {
+	usersMu.Lock()
 	u1, exists := users[u2.Email]
-
-	if !exists || u1 != u2 {
-		users[u2.Email] = u2
-
-		return updateMiddleware(middlewareName, middlewareNamespace, getIPsFromUsers())
+	if exists && u1 == u2 {
+		usersMu.Unlock()
+		return nil
 	}
-	return nil
+	users[u2.Email] = u2
+	ips := getIPsFromUsers()
+	usersMu.Unlock()
+
+	return updateMiddleware(middlewareName, middlewareNamespace, ips)
 }
 
 func getIPsFromUsers() []string {
-	// Create set to ensure no duplicates
 	set := make(map[string]struct{})
 	for _, v := range users {
 		set[v.IP] = struct{}{}
 	}
-
-	// Convert set to slice
 	ips := make([]string, 0, len(set))
 	for k := range set {
 		ips = append(ips, k)
@@ -113,30 +114,31 @@ func getUnstructured(middleware *Middleware) (*unstructured.Unstructured, error)
 }
 
 func getUsers(c *gin.Context) {
+	usersMu.RLock()
+	defer usersMu.RUnlock()
 	c.IndentedJSON(http.StatusOK, users)
 }
 
 func postUsers(c *gin.Context) {
 	email := c.GetHeader("X-User-Email")
 	if email == "" {
-		c.JSON(400, gin.H{
+		c.JSON(http.StatusBadRequest, gin.H{
 			"error": "Missing X-User-Email header",
 		})
+		return
 	}
 	user := user{
 		Email: email,
 		IP:    c.ClientIP(),
 	}
 
-	err := addUser(user)
-	if err != nil {
+	if err := addUser(user); err != nil {
 		log.Println("Failed to add user")
-		c.JSON(400, gin.H{
+		c.JSON(http.StatusInternalServerError, gin.H{
 			"error": "Failed to add user",
 		})
-	} else {
-		log.Println("Added user")
+		return
 	}
-
+	log.Println("Added user")
 	c.IndentedJSON(http.StatusCreated, user)
 }

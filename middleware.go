@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"time"
 
@@ -57,31 +58,32 @@ func NewMiddleware(name, namespace string) *Middleware {
 }
 
 func getOrCreateMiddleware(name *string, namespace *string) (*Middleware, error) {
-	var middleware *Middleware
-	var err error
 	u, err := dynClient.Resource(middlewareGVR).Namespace(*namespace).Get(context.TODO(), *name, metav1.GetOptions{})
 	if err != nil {
-		if errors.IsNotFound(err) {
-			middleware = NewMiddleware(*name, *namespace)
-			// write empty middleware
-			u, err = createMiddleware(middleware)
-			if err != nil {
-				log.Printf("Failed to create new middleware: %v", err)
-				return nil, err
-			} else {
-				log.Printf("Created new middleware: %v", middleware)
-			}
+		if !errors.IsNotFound(err) {
+			return nil, err
 		}
+		m := NewMiddleware(*name, *namespace)
+		u, err = createMiddleware(m)
+		if err != nil {
+			log.Printf("Failed to create new middleware: %v", err)
+			return nil, err
+		}
+		log.Printf("Created new middleware: %v", m)
 	}
-	err = runtime.DefaultUnstructuredConverter.FromUnstructured(u.Object, &middleware)
-	if err != nil {
+	var middleware Middleware
+	if err = runtime.DefaultUnstructuredConverter.FromUnstructured(u.Object, &middleware); err != nil {
 		log.Printf("Conversion failed when reading middleware: %v", err)
+		return nil, err
 	}
-	return middleware, err
+	return &middleware, nil
 }
 
 func createMiddleware(middleware *Middleware) (*unstructured.Unstructured, error) {
-	u, _ := getUnstructured(middleware)
+	u, err := getUnstructured(middleware)
+	if err != nil {
+		return nil, err
+	}
 	unstructured.RemoveNestedField(u.Object, "metadata", "resourceVersion")
 	u2, err := dynClient.Resource(middlewareGVR).Namespace(middleware.Metadata.Namespace).Create(context.TODO(), u, metav1.CreateOptions{})
 	if err != nil {
@@ -95,49 +97,28 @@ func mutate(middleware *unstructured.Unstructured, ips []string) error {
 }
 
 func updateMiddleware(name *string, namespace *string, ips []string) error {
-	middleware, err := getOrCreateMiddleware(name, namespace)
-	if err != nil {
-		log.Printf("Failed to obtain middleware: %v", err)
-		return err
-	}
-	u, _ := getUnstructured(middleware)
-
-	err = mutate(u, ips)
-	if err != nil {
-		log.Printf("Failed to mutate middleware: %v", err)
-		return err
-	}
 	const maxRetries = 5
 	for range maxRetries {
-		_, err = dynClient.Resource(middlewareGVR).Namespace(middleware.Metadata.Namespace).Update(context.TODO(), u, metav1.UpdateOptions{})
+		u, err := dynClient.Resource(middlewareGVR).Namespace(*namespace).Get(context.TODO(), *name, metav1.GetOptions{})
 		if err != nil {
-			if errors.IsConflict(err) {
-				log.Printf(err.Error())
-				log.Printf("Resource conflict, retrying")
-				time.Sleep(2 * time.Second)
-				continue
-			} else {
-				log.Printf("Failed to update middleware: %v", err)
-				break
-			}
-		} else {
-			log.Printf("Updated middleware")
-			break
+			log.Printf("Failed to get middleware: %v", err)
+			return err
 		}
+		if err = mutate(u, ips); err != nil {
+			log.Printf("Failed to mutate middleware: %v", err)
+			return err
+		}
+		_, err = dynClient.Resource(middlewareGVR).Namespace(*namespace).Update(context.TODO(), u, metav1.UpdateOptions{})
+		if err == nil {
+			log.Printf("Updated middleware")
+			return nil
+		}
+		if !errors.IsConflict(err) {
+			log.Printf("Failed to update middleware: %v", err)
+			return err
+		}
+		log.Printf("Resource conflict, retrying: %v", err)
+		time.Sleep(2 * time.Second)
 	}
-	return err
+	return fmt.Errorf("update middleware: exceeded %d retries", maxRetries)
 }
-
-//func writeMiddleware(middleware *Middleware) error {
-//	_, err := getMiddleware(middleware)
-//	if err != nil {
-//		if errors.IsNotFound(err) {
-//			err = createMiddleware(middleware)
-//		} else {
-//			log.Printf("Failed to check for existing middleware: %v", err)
-//		}
-//	} else {
-//		err = updateMiddleware(middleware)
-//	}
-//	return err
-//}
