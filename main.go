@@ -12,6 +12,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/peterbourgon/ff/v3"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -98,12 +100,30 @@ func main() {
 	}
 	log.Printf("Current allowlist: %v", ips)
 
-	router := gin.Default()
+	router := gin.New()
+	router.Use(gin.LoggerWithConfig(gin.LoggerConfig{SkipPaths: []string{"/health", "/ready"}}))
+	router.Use(gin.Recovery())
 	router.SetTrustedProxies(trustedProxies)
+	router.GET("/health", func(c *gin.Context) { c.Status(http.StatusOK) })
+	router.GET("/ready", readiness)
 	router.GET("/users", getUsers)
 	router.POST("/users", postUsers)
 
 	router.Run(fmt.Sprintf(":%d", *port))
+}
+
+func readiness(c *gin.Context) {
+	ctx := c.Request.Context()
+	if _, err := dynClient.Resource(middlewareGVR).Namespace(*middlewareNamespace).Get(ctx, *middlewareName, metav1.GetOptions{}); err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": fmt.Sprintf("middleware unavailable: %v", err)})
+		return
+	}
+	_, err := dynClient.Resource(configMapGVR).Namespace(*middlewareNamespace).Get(ctx, *configMapName, metav1.GetOptions{})
+	if err != nil && !k8serrors.IsNotFound(err) {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": fmt.Sprintf("configmap unavailable: %v", err)})
+		return
+	}
+	c.Status(http.StatusOK)
 }
 
 func resolveKubeConfig(override string) (*rest.Config, error) {
