@@ -28,10 +28,10 @@ type user struct {
 }
 
 var (
-	usersMu             sync.RWMutex
-	users               = make(map[string]user)
-	dynClient           *dynamic.DynamicClient
-	middlewareGVR       = schema.GroupVersionResource{
+	usersMu       sync.RWMutex
+	users         = make(map[string]user)
+	dynClient     *dynamic.DynamicClient
+	middlewareGVR = schema.GroupVersionResource{
 		Group:    "traefik.io",
 		Version:  "v1alpha1",
 		Resource: "middlewares",
@@ -107,7 +107,8 @@ func main() {
 	router.GET("/health", func(c *gin.Context) { c.Status(http.StatusOK) })
 	router.GET("/ready", readiness)
 	router.GET("/users", getUsers)
-	router.POST("/users", postUsers)
+	router.POST("/users", auth) // Backwards compatibility
+	router.GET("/auth", auth)   // Backwards compatibility
 
 	router.Run(fmt.Sprintf(":%d", *port))
 }
@@ -193,7 +194,7 @@ func getUsers(c *gin.Context) {
 	c.IndentedJSON(http.StatusOK, users)
 }
 
-func postUsers(c *gin.Context) {
+func auth(c *gin.Context) {
 	email := c.GetHeader("X-User-Email")
 	if email == "" {
 		c.JSON(http.StatusBadRequest, gin.H{
