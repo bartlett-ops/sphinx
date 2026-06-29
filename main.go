@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 
@@ -15,6 +16,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 )
 
@@ -49,6 +51,7 @@ func main() {
 	middlewareName = flag.String("middleware-name", "", "Name of allowlist middleware")
 	middlewareNamespace = flag.String("middleware-namespace", "kube-system", "Namespace of middleware")
 	configMapName = flag.String("configmap-name", "sphinx-users", "Name of ConfigMap for user persistence")
+	kubeconfig := flag.String("kubeconfig", "", "Path to kubeconfig file (auto-detected if not set)")
 	if err := ff.Parse(flag.CommandLine, os.Args[1:], ff.WithEnvVarPrefix("SPHINX")); err != nil {
 		log.Fatal(err)
 	}
@@ -69,7 +72,7 @@ func main() {
 	}
 	instanceID = hostname
 
-	config, err := clientcmd.BuildConfigFromFlags("", "/home/tom/.kube/config")
+	config, err := resolveKubeConfig(*kubeconfig)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -101,6 +104,20 @@ func main() {
 	router.POST("/users", postUsers)
 
 	router.Run(fmt.Sprintf(":%d", *port))
+}
+
+func resolveKubeConfig(override string) (*rest.Config, error) {
+	if override != "" {
+		return clientcmd.BuildConfigFromFlags("", override)
+	}
+	if cfg, err := rest.InClusterConfig(); err == nil {
+		return cfg, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, fmt.Errorf("get home dir: %w", err)
+	}
+	return clientcmd.BuildConfigFromFlags("", filepath.Join(home, ".kube", "config"))
 }
 
 func addUser(u2 user) error {
