@@ -100,7 +100,9 @@ func main() {
 	}
 	log.Printf("Current allowlist: %v", ips)
 
-	router := gin.Default()
+	router := gin.New()
+	router.Use(gin.LoggerWithConfig(gin.LoggerConfig{SkipPaths: []string{"/health", "/ready"}}))
+	router.Use(gin.Recovery())
 	router.SetTrustedProxies(trustedProxies)
 	router.GET("/health", func(c *gin.Context) { c.Status(http.StatusOK) })
 	router.GET("/ready", readiness)
