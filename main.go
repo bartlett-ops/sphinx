@@ -195,10 +195,10 @@ func getUsers(c *gin.Context) {
 }
 
 func auth(c *gin.Context) {
-	email := c.GetHeader("X-User-Email")
+	email := c.GetHeader("X-Forwarded-User")
 	if email == "" {
 		c.JSON(http.StatusBadRequest, gin.H{
-			"error": "Missing X-User-Email header",
+			"error": "Missing X-Forwarded-User header",
 		})
 		return
 	}
