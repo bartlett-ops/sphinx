@@ -34,9 +34,10 @@ type MiddlewareSpec struct {
 }
 
 type IPAllowList struct {
-	IPStrategy       IPStrategy `json:"ipStrategy"`
-	RejectStatusCode int        `json:"rejectStatusCode"`
-	SourceRange      []string   `json:"sourceRange"`
+	// Disabled as not needed
+	// IPStrategy       IPStrategy `json:"ipStrategy"`
+	// RejectStatusCode int        `json:"rejectStatusCode"`
+	SourceRange []string `json:"sourceRange"`
 }
 
 type IPStrategy struct {
@@ -94,9 +95,9 @@ func createMiddleware(middleware *Middleware) (*unstructured.Unstructured, error
 	return u2, err
 }
 
-func mutate(u *unstructured.Unstructured, ips []string) error {
+func mutate(u *unstructured.Unstructured, cidrs []string) error {
 	existing, _, _ := unstructured.NestedStringSlice(u.Object, "spec", "ipAllowList", "sourceRange")
-	return unstructured.SetNestedStringSlice(u.Object, unionStrings(existing, ips), "spec", "ipAllowList", "sourceRange")
+	return unstructured.SetNestedStringSlice(u.Object, unionStrings(existing, cidrs), "spec", "ipAllowList", "sourceRange")
 }
 
 func unionStrings(a, b []string) []string {
@@ -165,7 +166,7 @@ func saveUsers() error {
 	return err
 }
 
-func updateMiddleware(name *string, namespace *string, ips []string) error {
+func updateMiddleware(name *string, namespace *string, cidrs []string) error {
 	const maxRetries = 5
 	for range maxRetries {
 		u, err := dynClient.Resource(middlewareGVR).Namespace(*namespace).Get(context.TODO(), *name, metav1.GetOptions{})
@@ -173,7 +174,7 @@ func updateMiddleware(name *string, namespace *string, ips []string) error {
 			log.Printf("Failed to get middleware: %v", err)
 			return err
 		}
-		if err = mutate(u, ips); err != nil {
+		if err = mutate(u, cidrs); err != nil {
 			log.Printf("Failed to mutate middleware: %v", err)
 			return err
 		}
