@@ -94,11 +94,11 @@ func main() {
 	}
 	log.Printf("Loaded %d users", len(users))
 
-	ips := getIPsFromUsers()
-	if err = updateMiddleware(middlewareName, middlewareNamespace, ips); err != nil {
+	cidrs := getCIDRsFromUsers()
+	if err = updateMiddleware(middlewareName, middlewareNamespace, cidrs); err != nil {
 		log.Fatalf("Failed to sync middleware on startup: %v", err)
 	}
-	log.Printf("Current allowlist: %v", ips)
+	log.Printf("Current allowlist: %v", cidrs)
 
 	router := gin.New()
 	router.Use(gin.LoggerWithConfig(gin.LoggerConfig{SkipPaths: []string{"/health", "/ready"}}))
@@ -149,13 +149,13 @@ func addUser(u2 user) error {
 		return nil
 	}
 	users[u2.Email] = u2
-	ips := getIPsFromUsers()
+	cidrs := getCIDRsFromUsers()
 	usersMu.Unlock()
 
 	if err := saveUsers(); err != nil {
 		return err
 	}
-	return updateMiddleware(middlewareName, middlewareNamespace, ips)
+	return updateMiddleware(middlewareName, middlewareNamespace, cidrs)
 }
 
 func resolveClientIP(c *gin.Context) string {
@@ -168,16 +168,16 @@ func resolveClientIP(c *gin.Context) string {
 	return c.ClientIP()
 }
 
-func getIPsFromUsers() []string {
+func getCIDRsFromUsers() []string {
 	set := make(map[string]struct{})
 	for _, v := range users {
-		set[v.IP] = struct{}{}
+		set[v.IP+"/32"] = struct{}{}
 	}
-	ips := make([]string, 0, len(set))
+	cidrs := make([]string, 0, len(set))
 	for k := range set {
-		ips = append(ips, k)
+		cidrs = append(cidrs, k)
 	}
-	return ips
+	return cidrs
 }
 
 func getUnstructured(middleware *Middleware) (*unstructured.Unstructured, error) {
