@@ -201,7 +201,16 @@ func (c *configMapStore) Upsert(ctx context.Context, email, cidr string, now tim
 			}
 		}
 		last = err
-		time.Sleep(backoff(attempt))
+		// No point sleeping after the final attempt, and a cancelled caller
+		// must not wait out a backoff it will never use.
+		if attempt == maxRetries-1 {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(backoff(attempt)):
+		}
 	}
 	return nil, fmt.Errorf("upsert %s: exceeded %d retries: %w", email, maxRetries, last)
 }
