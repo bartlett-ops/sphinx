@@ -49,16 +49,15 @@ Alternatives considered and rejected:
 
 - **One ConfigMap key per user.** ConfigMap keys admit only alphanumerics, `-`, `_`, and
   `.`; `@` is illegal, so every email would need encoding or hashing. This buys lock-free
-  per-key writes we do not need and costs readability and the atomic multi-entry
-  operations the TTL sweep wants.
+  per-key writes we do not need, and costs both readability and the ability to rewrite the
+  whole record set atomically — which the migration path depends on.
 - **A `SphinxUser` custom resource per user.** The textbook Kubernetes answer, granting
   per-object atomicity for free. Rejected as disproportionate: it requires shipping and
   versioning a CRD, expanding RBAC, and adopting informer machinery to solve a problem one
   ConfigMap solves. Revisit if Sphinx grows to manage many resource types.
-- **External store (Redis).** Native per-key TTL is the most elegant expiry story, but it
-  introduces a stateful dependency requiring persistence configuration and credential
-  management. The dependency does not pay for itself for a small allowlist that Kubernetes
-  already stores.
+- **External store (Redis).** Introduces a stateful dependency requiring persistence
+  configuration and credential management. The dependency does not pay for itself for a
+  small allowlist that Kubernetes already stores.
 
 ## Architecture
 
@@ -76,9 +75,11 @@ or HTTP. Each method returns the resulting authoritative `*Store`.
 type UserStore interface {
     Load(ctx context.Context) (*Store, error)
     Upsert(ctx context.Context, email, cidr string, now time.Time) (*Store, error)
-    Sweep(ctx context.Context, ttl time.Duration, now time.Time) (*Store, error)
 }
 ```
+
+Records persist indefinitely. There is no expiry and no `Sweep`; the only way a record
+changes is an `Upsert` for that email.
 
 ### `allowlist.go` — the Traefik writer
 
@@ -101,16 +102,18 @@ funnel through it:
 // project derives the desired allowlist from the store and writes it authoritatively.
 func (r *Reconciler) project(ctx context.Context, s *Store) error  // -> Apply(cidrs, s.Generation)
 
-// Authenticate is the hot path: no sweep, minimal latency.
+// Authenticate is the hot path.
 func (r *Reconciler) Authenticate(ctx context.Context, email, cidr string) error  // Upsert -> project
 
-// Reconcile is the background tick: expiry plus drift repair.
-func (r *Reconciler) Reconcile(ctx context.Context) error  // Load -> Sweep -> project
+// Reconcile is the background tick: drift repair only.
+func (r *Reconciler) Reconcile(ctx context.Context) error  // Load -> project
 ```
 
-The auth path deliberately does **not** sweep. Expiry is not urgent enough to sit in the
-latency budget of a request that a user is blocked on, and the ticker handles it within one
-`reconcileInterval`.
+The background ticker survives the removal of expiry, because expiry was never its only
+job. It is what repairs drift: if a middleware write is lost, or `sourceRange` is edited by
+hand, the next tick re-applies the store's projection and heals it. Without it, the
+allowlist could silently diverge from the store until the next authentication happened to
+correct it.
 
 ### `main.go` — flags, wiring, HTTP handlers
 
@@ -139,16 +142,16 @@ data:
       "version": 1,
       "generation": 42,
       "users": {
-        "alice@example.com": {"cidr": "203.0.113.7/32",  "lastSeen": "2026-07-09T10:04:11Z"},
-        "bob@example.com":   {"cidr": "198.51.100.4/32", "lastSeen": "2026-07-08T22:13:02Z"}
+        "alice@example.com": {"cidr": "203.0.113.7/32",  "updatedAt": "2026-07-09T10:04:11Z"},
+        "bob@example.com":   {"cidr": "198.51.100.4/32", "updatedAt": "2026-07-08T22:13:02Z"}
       }
     }
 ```
 
 ```go
 type Record struct {
-    CIDR     string    `json:"cidr"`
-    LastSeen time.Time `json:"lastSeen"`
+    CIDR      string    `json:"cidr"`
+    UpdatedAt time.Time `json:"updatedAt"`
 }
 
 type Store struct {
@@ -162,6 +165,13 @@ Email is the map key, so a user has exactly one record by construction; re-authe
 overwrites `Record.CIDR` in place. `version` is a schema tag for future migrations.
 `generation` is a monotonic counter that prevents stale middleware writes (see
 Concurrency).
+
+`UpdatedAt` records when the CIDR last *changed*, not when the user was last seen. It is
+written only on a mutating `Upsert`, so it costs no extra API traffic, and it exists purely
+for operator forensics — answering "when did this CIDR get registered?" during debugging.
+Nothing in Sphinx reads it. A `lastSeen` field would have to be refreshed on an interval to
+stay meaningful, which would defeat the write-skip cache below; `UpdatedAt` has no such
+cost.
 
 At a few thousand users this document remains well under the 1 MiB ConfigMap limit, and
 the entire store is legible via `kubectl get cm sphinx-users -o yaml`.
@@ -179,8 +189,9 @@ Every mutating store write is a read-modify-write against the ConfigMap's
 `resourceVersion`, retried on 409 Conflict. This serializes all replicas through the API
 server, making `generation` strictly monotonic with no inter-pod coordination.
 
-`generation` increments on every mutating store write: an `Upsert` that changes a record,
-or a `Sweep` that drops one. An `Upsert` that changes nothing does not increment it.
+`generation` increments on every mutating store write, meaning an `Upsert` that adds a
+record or changes an existing record's CIDR. An `Upsert` that changes nothing does not
+increment it.
 
 `generation` guards the middleware write. Given two replicas, one applying generation 42
 and another 43: if 43 lands first and 42 arrives late, the late write would regress the
@@ -197,8 +208,8 @@ would make the reconcile loop inert. `Apply` is idempotent, so the redundant wri
 harmless. A middleware carrying no annotation is treated as generation 0, so the first
 `Apply` always proceeds.
 
-The TTL sweep runs independently on every replica. It requires no leader election, being
-idempotent under compare-and-swap; concurrent sweeps converge.
+The background reconcile runs independently on every replica. It requires no leader
+election, being idempotent under compare-and-swap; concurrent reconciles converge.
 
 ### The hot path
 
@@ -206,15 +217,18 @@ idempotent under compare-and-swap; concurrent sweeps converge.
 once per login. A ConfigMap write plus a middleware write per HTTP request would overwhelm
 the API server.
 
-Each pod therefore keeps an in-memory cache of `email → (cidr, lastWriteTime)`. If the
-CIDR is unchanged and the last write falls within `refreshInterval`, the handler returns
-200 without contacting Kubernetes. This is strictly a cache and never a source of truth: a
-miss causes only a harmless redundant write, and a pod restart merely re-warms it.
+Each pod therefore keeps an in-memory cache of `email → cidr`. If the cached CIDR matches
+the request's, the handler returns 200 without contacting Kubernetes. This is strictly a
+cache and never a source of truth: a miss causes only a harmless redundant `Upsert`, which
+is itself a no-op when the stored CIDR already matches, and a pod restart merely re-warms
+it.
 
-This yields a correctness invariant. Because skipped writes do not refresh `lastSeen`, an
-actively browsing user would eventually be swept out from under themselves unless
-`refreshInterval` is meaningfully less than `ttl`. **Sphinx validates `refreshInterval <
-ttl` at startup and fails fast otherwise.**
+Because records never expire, the cache needs no time component and no periodic refresh — a
+CIDR is either current or it is not. This is the one place the removal of expiry simplifies
+rather than complicates the design: an earlier draft of this spec carried a TTL and had to
+guarantee that the cache's refresh interval stayed well below it, or an actively browsing
+user's record would be swept out from under them mid-session. That invariant is now gone
+along with the sweep.
 
 ### Auth is synchronous
 
@@ -226,11 +240,10 @@ the client.
 
 | Flag | Env var | Default | Description |
 |------|---------|---------|-------------|
-| `--user-ttl` | `SPHINX_USER_TTL` | `168h` | Records not refreshed within this window are swept. |
-| `--reconcile-interval` | `SPHINX_RECONCILE_INTERVAL` | `60s` | Background reconcile and sweep period. |
-| `--refresh-interval` | `SPHINX_REFRESH_INTERVAL` | `ttl/10`, capped at `1h` | Minimum interval between `lastSeen` writes for an unchanged CIDR. Must be less than `--user-ttl`. |
+| `--reconcile-interval` | `SPHINX_RECONCILE_INTERVAL` | `60s` | Background drift-repair period. |
 
-Existing flags are unchanged.
+Existing flags are unchanged. One new flag, rather than three: with records persisting
+indefinitely there is no `--user-ttl` and no `--refresh-interval`.
 
 ## Migration from the sharded format
 
@@ -242,8 +255,8 @@ migrates:
    warning level.** The legacy format carries no timestamps, so the current CIDR cannot be
    determined; allowlisting either risks preserving a stale one, which is the bug under
    repair. The affected user re-authenticates and self-corrects.
-3. Set every migrated record's `lastSeen` to the migration time, granting a full TTL
-   window.
+3. Set every migrated record's `updatedAt` to the migration time, since the legacy format
+   carries no timestamp to preserve.
 4. Write `users.json` and delete the legacy keys in a single ConfigMap update — atomic,
    since it is one object.
 
@@ -286,10 +299,12 @@ Against an in-memory `UserStore` fake:
 - **Pod replacement.** Write records, simulate a replica swap by constructing a fresh
   store instance against the same ConfigMap, assert no orphaned data and no growth in the
   CIDR set.
-- **Sweep.** Expires records past TTL, retains fresh records, leaves `generation`
-  monotonic.
-- **Refresh invariant.** An actively authenticating user is never swept — that is,
-  `refreshInterval < ttl` genuinely protects them.
+- **Persistence.** Records survive an arbitrary number of reconcile ticks unchanged; no
+  code path removes a record other than an `Upsert` replacing its CIDR.
+- **Generation monotonicity.** A mutating `Upsert` increments `generation`; a no-op
+  `Upsert` for an unchanged CIDR leaves it untouched and writes nothing.
+- **Write-skip cache.** A repeated authentication with an unchanged CIDR issues no
+  Kubernetes API calls; a changed CIDR bypasses the cache and writes.
 
 Against client-go's fake dynamic client:
 
@@ -311,4 +326,18 @@ Against a fake allowlist writer:
 
 ## Out of scope
 
-Explicit user deletion via the API, and leader election for the sweep loop.
+Explicit user deletion via the API, and leader election for the reconcile loop.
+
+**Expiry.** Records persist indefinitely by decision. The consequence is that a CIDR
+registered once — from a hotel, a coffee shop, a since-abandoned home address — stays
+allowlisted until that user next authenticates from somewhere else, and forever if they
+never do. The allowlist therefore only grows, bounded by the number of distinct users
+rather than by recent activity. Accepted deliberately: this is an allowlist of known,
+authenticated users, not a session store, and the alternative imposes periodic re-auth
+friction.
+
+Reinstating expiry later is cheap and localised: add a `Sweep` method to `UserStore`, call
+it from `Reconcile` before `project`, and reintroduce the write-refresh discipline that
+keeps an active user's timestamp current. `UpdatedAt` is not sufficient for that on its own
+— it tracks CIDR changes, not activity — so a genuine `LastSeen` field would be needed, and
+with it the `refreshInterval < ttl` invariant this design was able to drop.
