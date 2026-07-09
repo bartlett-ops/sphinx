@@ -2345,6 +2345,10 @@ EOF
 
 Expected: `middleware.traefik.io/sphinx-allowlist-probe created (server dry run)`.
 
+**Resolved 2026-07-09 against a live cluster (Traefik CRDs installed):** the CRD accepts
+both an empty `sourceRange: []` and the `sphinx.bartlett.ops/generation` annotation. The
+dry run persisted nothing. No code change is needed; the fallback below was not required.
+
 If the CRD **rejects** an empty array (a `minItems` validation error), stop and report. The fix is for `Apply` to remove the `sourceRange` field when `cidrs` is empty, via `unstructured.RemoveNestedField(u.Object, "spec", "ipAllowList", "sourceRange")`, and a matching change to `TestAllowlistApplyEmptySet`. Do not guess — the empty case is what a fresh install with no users produces.
 
 - [ ] **Step 2: Exercise the real registration path**
@@ -2363,7 +2367,12 @@ curl -s -o /dev/null -w '%{http_code}\n' -H 'X-Forwarded-User: alice@example.com
 curl -s -o /dev/null -w '%{http_code}\n' -H 'X-Forwarded-User: alice@example.com' -H 'X-Forwarded-For: 198.51.100.4' localhost:8080/auth
 ```
 
-Expected: `201`, then `200` (served from the write-skip cache), then `201`.
+Expected: `200`, then `200`, then `201`.
+
+The first call returns `200`, not `201`, and that is correct. The startup `Reconcile`
+rebuilds the write-skip cache from the store, so a user already registered at that CIDR is
+a cache hit and no write occurs. `201 Created` is reserved for a registration that was
+actually written. Only the third call, from a new address, writes.
 
 - [ ] **Step 3: Confirm the old CIDR is gone — the whole point**
 
