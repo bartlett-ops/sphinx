@@ -30,6 +30,7 @@ These were confirmed empirically against `k8s.io/client-go v0.35.3` before this 
 2. `Middleware` is a CRD absent from any scheme, so the fake must be built with `dynamicfake.NewSimpleDynamicClientWithCustomListKinds(scheme, listKinds, objs...)` supplying both `ConfigMapList` and `MiddlewareList`.
 3. A one-shot reactor (fire once, then return `false` to fall through to the default object tracker) works as expected.
 4. `go mod tidy` is required once — the fake pulls in indirect test dependencies only. No new *direct* dependencies.
+5. **A reactor must not call back into the client.** `k8stesting.Fake.Invokes` holds a non-reentrant lock across the reactor callback, so a nested `c.Resource(...).Update(...)` from inside a reactor deadlocks against the `Update` that dispatched it — 100% of the time, confirmed by goroutine dump. To stage a competing write from inside a reactor, use `c.Tracker().Update(gvr, obj, namespace)`, which bypasses that lock. (Discovered during Task 2; the plan's original code had this bug.)
 
 ## File Structure
 
@@ -439,12 +440,14 @@ func TestConfigMapStoreUpsert(t *testing.T) {
 				return false, nil, nil
 			}
 			fired = true
-			// A competing replica lands first.
+			// A competing replica lands first. This must go through the
+			// tracker, not c.Resource(...).Update(...): Fake.Invokes holds a
+			// non-reentrant lock across the reactor callback, so a nested
+			// client call deadlocks against the Update that dispatched us.
 			competitor := newStore()
 			competitor.upsert("bob@example.com", "198.51.100.4/32", now)
 			cm := configMapWith(t, map[string]string{storeKey: storeJSON(t, competitor)})
-			if _, err := c.Resource(configMapGVR).Namespace("kube-system").
-				Update(context.Background(), cm, metav1.UpdateOptions{}); err != nil {
+			if err := c.Tracker().Update(configMapGVR, cm, "kube-system"); err != nil {
 				t.Errorf("competitor update: %v", err)
 			}
 			return true, nil, k8serrors.NewConflict(
