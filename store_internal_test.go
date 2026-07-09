@@ -507,4 +507,44 @@ func TestConfigMapStoreMigrate(t *testing.T) {
 			t.Fatal("a conflict with no migrated document must surface as an error")
 		}
 	})
+
+	// An old pod touches the ConfigMap between our Get and Update. That is a
+	// conflict, but nobody migrated: we must re-read and retry, not die.
+	t.Run("retries when a legacy pod bumps the configmap", func(t *testing.T) {
+		c := newFakeClient(t, configMapWith(t, map[string]string{
+			"sphinx-abc123": legacyBlob(map[string]string{"alice@example.com": "203.0.113.7"}),
+		}))
+		st := newConfigMapStore(c, "kube-system", "sphinx-users")
+
+		var fired bool
+		c.PrependReactor("update", "configmaps", func(k8stesting.Action) (bool, runtime.Object, error) {
+			if fired {
+				return false, nil, nil
+			}
+			fired = true
+			// A legacy pod re-adds its own key. Staged through the tracker: a
+			// reactor must not call back into the client.
+			cm := configMapWith(t, map[string]string{
+				"sphinx-abc123": legacyBlob(map[string]string{"alice@example.com": "203.0.113.7"}),
+				"sphinx-def456": legacyBlob(map[string]string{"bob@example.com": "198.51.100.4"}),
+			})
+			if err := c.Tracker().Update(configMapGVR, cm, "kube-system"); err != nil {
+				t.Errorf("legacy pod update: %v", err)
+			}
+			return true, nil, k8serrors.NewConflict(
+				schema.GroupResource{Resource: "configmaps"}, "sphinx-users", errors.New("stale"))
+		})
+
+		if err := st.Migrate(ctx, now); err != nil {
+			t.Fatalf("Migrate must retry a conflict when nobody migrated: %v", err)
+		}
+		got := readStore(t, c)
+		// The retry re-read, so it picked up the legacy pod's newly added user.
+		if _, ok := got.Users["bob@example.com"]; !ok {
+			t.Error("retry did not re-read: bob's legacy record was lost")
+		}
+		if _, ok := got.Users["alice@example.com"]; !ok {
+			t.Error("alice's legacy record was lost")
+		}
+	})
 }

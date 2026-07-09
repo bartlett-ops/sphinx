@@ -232,14 +232,47 @@ type legacyUser struct {
 	IP    string `json:"ip"`
 }
 
-// Migrate rewrites the retired hostname-keyed layout into a single users.json
-// document, dropping the legacy keys in the same atomic update. It is a no-op
-// once users.json exists, or when the ConfigMap is absent.
+// Migrate converts the retired pod-sharded layout into a single users.json
+// document, retrying on conflict. During the cutover rollout, old pods are
+// still writing their own hostname-keyed entries, so losing the compare-and-swap
+// is expected rather than fatal.
+func (c *configMapStore) Migrate(ctx context.Context, now time.Time) error {
+	var last error
+	for attempt := range maxRetries {
+		err := c.migrateOnce(ctx, now)
+		if err == nil {
+			return nil
+		}
+		if !k8serrors.IsConflict(err) {
+			return err
+		}
+		// Another replica may have migrated, in which case the work is done.
+		// Otherwise a legacy pod merely touched the ConfigMap: re-read and retry.
+		if c.migrated(ctx) {
+			log.Printf("Migration: another replica migrated first")
+			return nil
+		}
+		last = err
+		if attempt == maxRetries-1 {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(backoff(attempt)):
+		}
+	}
+	return fmt.Errorf("migrate: exceeded %d retries: %w", maxRetries, last)
+}
+
+// migrateOnce rewrites the retired hostname-keyed layout into a single
+// users.json document, dropping the legacy keys in the same atomic update. It
+// is a no-op once users.json exists, or when the ConfigMap is absent.
 //
 // A user whose pod blobs disagree about their IP is dropped: the legacy format
 // carries no timestamp, so the current CIDR cannot be determined, and keeping
 // the wrong one would preserve exactly the staleness this redesign removes.
-func (c *configMapStore) Migrate(ctx context.Context, now time.Time) error {
+func (c *configMapStore) migrateOnce(ctx context.Context, now time.Time) error {
 	u, err := c.get(ctx)
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
@@ -301,12 +334,6 @@ func (c *configMapStore) Migrate(ctx context.Context, now time.Time) error {
 		return fmt.Errorf("set data: %w", err)
 	}
 	if _, err := c.resource().Update(ctx, u, metav1.UpdateOptions{}); err != nil {
-		// Losing the migration race is the expected outcome for every replica
-		// but one. It means the work is already done, not that startup failed.
-		if k8serrors.IsConflict(err) && c.migrated(ctx) {
-			log.Printf("Migration: another replica migrated first")
-			return nil
-		}
 		return fmt.Errorf("update configmap: %w", err)
 	}
 	log.Printf("Migration: wrote %d users, removed %d legacy keys", len(s.Users), len(data))
