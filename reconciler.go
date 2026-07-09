@@ -31,7 +31,7 @@ func newReconciler(s UserStore, a Allowlist) *Reconciler {
 }
 
 func (r *Reconciler) project(ctx context.Context, s *Store) error {
-	return r.allowlist.Apply(ctx, s.CIDRs(), s.Generation)
+	return r.allowlist.Apply(ctx, s.CIDRs(), s.Generation, s.UID)
 }
 
 // Authenticate records email at cidr and reports whether a write occurred; a

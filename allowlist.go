@@ -13,14 +13,17 @@ import (
 	"k8s.io/client-go/dynamic"
 )
 
-// generationAnnotation records the store generation last written to the
-// middleware, so a slow replica cannot overwrite a newer allowlist.
-const generationAnnotation = "sphinx.bartlett.ops/generation"
+const (
+	// generationAnnotation records the store generation last written.
+	generationAnnotation = "sphinx.bartlett.ops/generation"
+	// storeUIDAnnotation records which store lineage that generation belongs to.
+	storeUIDAnnotation = "sphinx.bartlett.ops/store-uid"
+)
 
 // Allowlist writes the desired CIDR set. Implementations know nothing about
 // users; the set is already projected.
 type Allowlist interface {
-	Apply(ctx context.Context, cidrs []string, generation int64) error
+	Apply(ctx context.Context, cidrs []string, generation int64, storeUID string) error
 }
 
 type traefikAllowlist struct {
@@ -91,13 +94,28 @@ func stampedGeneration(u *unstructured.Unstructured) int64 {
 	return g
 }
 
+// stampedStoreUID reads which store lineage the stamped generation belongs to.
+// An absent annotation reads as "", which never equals a real uid.
+func stampedStoreUID(u *unstructured.Unstructured) string {
+	raw, found, err := unstructured.NestedString(u.Object, "metadata", "annotations", storeUIDAnnotation)
+	if err != nil || !found {
+		return ""
+	}
+	return raw
+}
+
 // Apply replaces spec.ipAllowList.sourceRange with exactly cidrs. It never
 // unions: that is what let a re-authenticating user's old CIDR survive.
 //
 // A write whose generation is strictly older than the stamped one is skipped,
 // so a late replica cannot resurrect a removed CIDR. An equal generation
 // proceeds, which is how the background reconcile repairs drift.
-func (a *traefikAllowlist) Apply(ctx context.Context, cidrs []string, generation int64) error {
+//
+// The generation counter only orders writes within one store lineage: it is
+// scoped by storeUID, so a ConfigMap that was deleted and recreated (and thus
+// restarted its counter) is recognized as a fresh start rather than skipped as
+// stale.
+func (a *traefikAllowlist) Apply(ctx context.Context, cidrs []string, generation int64, storeUID string) error {
 	if cidrs == nil {
 		cidrs = []string{}
 	}
@@ -108,7 +126,11 @@ func (a *traefikAllowlist) Apply(ctx context.Context, cidrs []string, generation
 			return fmt.Errorf("get middleware: %w", err)
 		}
 
-		if stamped := stampedGeneration(u); generation < stamped {
+		// The generation counter only orders writes from one store. A recreated
+		// ConfigMap restarts it, so a lower generation from a different lineage
+		// is a fresh start, not a stale write, and must not be skipped.
+		stamped := stampedGeneration(u)
+		if stampedStoreUID(u) == storeUID && generation < stamped {
 			log.Printf("Skipping allowlist write: generation %d is older than stamped %d", generation, stamped)
 			return nil
 		}
@@ -119,6 +141,9 @@ func (a *traefikAllowlist) Apply(ctx context.Context, cidrs []string, generation
 		if err := unstructured.SetNestedField(u.Object, strconv.FormatInt(generation, 10),
 			"metadata", "annotations", generationAnnotation); err != nil {
 			return fmt.Errorf("set generation annotation: %w", err)
+		}
+		if err := unstructured.SetNestedField(u.Object, storeUID, "metadata", "annotations", storeUIDAnnotation); err != nil {
+			return fmt.Errorf("set store-uid annotation: %w", err)
 		}
 
 		if _, err = a.resource().Update(ctx, u, metav1.UpdateOptions{}); err == nil {

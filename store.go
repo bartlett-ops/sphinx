@@ -2,10 +2,13 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
 	"sort"
+	"strconv"
 	"time"
 
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
@@ -34,12 +37,29 @@ type Record struct {
 // exactly one CIDR by construction.
 type Store struct {
 	Version    int               `json:"version"`
+	UID        string            `json:"uid"`
 	Generation int64             `json:"generation"`
 	Users      map[string]Record `json:"users"`
 }
 
 func newStore() *Store {
 	return &Store{Version: storeVersion, Users: make(map[string]Record)}
+}
+
+// ensureUID assigns a lineage identifier the first time the document is
+// persisted. A ConfigMap that is deleted and recreated gets a new one, which is
+// how the allowlist writer learns that a lower generation is a fresh start
+// rather than a stale write.
+func (s *Store) ensureUID() {
+	if s.UID != "" {
+		return
+	}
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		s.UID = strconv.FormatInt(time.Now().UnixNano(), 16)
+		return
+	}
+	s.UID = hex.EncodeToString(b)
 }
 
 // upsert sets email's CIDR and reports whether the store changed. Generation
@@ -144,6 +164,7 @@ func (c *configMapStore) Check(ctx context.Context) error {
 }
 
 func (c *configMapStore) create(ctx context.Context, s *Store) error {
+	s.ensureUID()
 	b, err := json.Marshal(s)
 	if err != nil {
 		return fmt.Errorf("marshal store: %w", err)
@@ -161,6 +182,7 @@ func (c *configMapStore) create(ctx context.Context, s *Store) error {
 // write persists s into u, preserving u's resourceVersion so the API server
 // rejects the update if another replica wrote first.
 func (c *configMapStore) write(ctx context.Context, u *unstructured.Unstructured, s *Store) error {
+	s.ensureUID()
 	b, err := json.Marshal(s)
 	if err != nil {
 		return fmt.Errorf("marshal store: %w", err)
@@ -323,6 +345,7 @@ func (c *configMapStore) migrateOnce(ctx context.Context, now time.Time) error {
 		}
 	}
 	s.Generation = 1
+	s.ensureUID()
 
 	b, err := json.Marshal(s)
 	if err != nil {

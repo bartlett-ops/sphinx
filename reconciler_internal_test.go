@@ -36,16 +36,18 @@ type fakeAllowlist struct {
 	calls   int
 	last    []string
 	lastGen int64
+	lastUID string
 	err     error
 }
 
-func (f *fakeAllowlist) Apply(_ context.Context, cidrs []string, generation int64) error {
+func (f *fakeAllowlist) Apply(_ context.Context, cidrs []string, generation int64, storeUID string) error {
 	f.calls++
 	if f.err != nil {
 		return f.err
 	}
 	f.last = append([]string(nil), cidrs...)
 	f.lastGen = generation
+	f.lastUID = storeUID
 	return nil
 }
 

@@ -87,7 +87,7 @@ func TestAllowlistApplyReplacesRatherThanUnions(t *testing.T) {
 	c := newFakeClient(t, middlewareWith(t, []string{"203.0.113.7/32"}, nil))
 	a := newTraefikAllowlist(c, "kube-system", "sphinx-allowlist")
 
-	if err := a.Apply(ctx, []string{"198.51.100.4/32"}, 1); err != nil {
+	if err := a.Apply(ctx, []string{"198.51.100.4/32"}, 1, "uid-1"); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
 	got := readSourceRange(t, c)
@@ -102,10 +102,10 @@ func TestAllowlistGenerationGuard(t *testing.T) {
 	t.Run("older generation is a no-op", func(t *testing.T) {
 		c := newFakeClient(t, middlewareWith(t,
 			[]string{"198.51.100.4/32"},
-			map[string]string{generationAnnotation: "43"}))
+			map[string]string{generationAnnotation: "43", storeUIDAnnotation: "uid-1"}))
 		a := newTraefikAllowlist(c, "kube-system", "sphinx-allowlist")
 
-		if err := a.Apply(ctx, []string{"203.0.113.7/32"}, 42); err != nil {
+		if err := a.Apply(ctx, []string{"203.0.113.7/32"}, 42, "uid-1"); err != nil {
 			t.Fatalf("Apply: %v", err)
 		}
 		if got := readSourceRange(t, c); !equalStrings(got, []string{"198.51.100.4/32"}) {
@@ -117,10 +117,10 @@ func TestAllowlistGenerationGuard(t *testing.T) {
 	t.Run("equal generation proceeds and repairs drift", func(t *testing.T) {
 		c := newFakeClient(t, middlewareWith(t,
 			[]string{"1.2.3.4/32"}, // hand-edited junk
-			map[string]string{generationAnnotation: "42"}))
+			map[string]string{generationAnnotation: "42", storeUIDAnnotation: "uid-1"}))
 		a := newTraefikAllowlist(c, "kube-system", "sphinx-allowlist")
 
-		if err := a.Apply(ctx, []string{"203.0.113.7/32"}, 42); err != nil {
+		if err := a.Apply(ctx, []string{"203.0.113.7/32"}, 42, "uid-1"); err != nil {
 			t.Fatalf("Apply: %v", err)
 		}
 		if got := readSourceRange(t, c); !equalStrings(got, []string{"203.0.113.7/32"}) {
@@ -132,7 +132,7 @@ func TestAllowlistGenerationGuard(t *testing.T) {
 		c := newFakeClient(t, middlewareWith(t, []string{"1.2.3.4/32"}, nil))
 		a := newTraefikAllowlist(c, "kube-system", "sphinx-allowlist")
 
-		if err := a.Apply(ctx, []string{"203.0.113.7/32"}, 7); err != nil {
+		if err := a.Apply(ctx, []string{"203.0.113.7/32"}, 7, "uid-1"); err != nil {
 			t.Fatalf("Apply: %v", err)
 		}
 		if got := readSourceRange(t, c); !equalStrings(got, []string{"203.0.113.7/32"}) {
@@ -143,10 +143,10 @@ func TestAllowlistGenerationGuard(t *testing.T) {
 	t.Run("malformed annotation is treated as zero", func(t *testing.T) {
 		c := newFakeClient(t, middlewareWith(t,
 			[]string{"1.2.3.4/32"},
-			map[string]string{generationAnnotation: "banana"}))
+			map[string]string{generationAnnotation: "banana", storeUIDAnnotation: "uid-1"}))
 		a := newTraefikAllowlist(c, "kube-system", "sphinx-allowlist")
 
-		if err := a.Apply(ctx, []string{"203.0.113.7/32"}, 1); err != nil {
+		if err := a.Apply(ctx, []string{"203.0.113.7/32"}, 1, "uid-1"); err != nil {
 			t.Fatalf("Apply: %v", err)
 		}
 		if got := readSourceRange(t, c); !equalStrings(got, []string{"203.0.113.7/32"}) {
@@ -158,7 +158,7 @@ func TestAllowlistGenerationGuard(t *testing.T) {
 		c := newFakeClient(t, middlewareWith(t, nil, nil))
 		a := newTraefikAllowlist(c, "kube-system", "sphinx-allowlist")
 
-		if err := a.Apply(ctx, []string{"203.0.113.7/32"}, 42); err != nil {
+		if err := a.Apply(ctx, []string{"203.0.113.7/32"}, 42, "uid-1"); err != nil {
 			t.Fatalf("Apply: %v", err)
 		}
 		u, err := c.Resource(middlewareGVR).Namespace("kube-system").
@@ -172,12 +172,80 @@ func TestAllowlistGenerationGuard(t *testing.T) {
 	})
 }
 
+func TestAllowlistGenerationGuardAcrossStoreLineages(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("older generation from the same store is skipped", func(t *testing.T) {
+		c := newFakeClient(t, middlewareWith(t, []string{"198.51.100.4/32"}, map[string]string{
+			generationAnnotation: "43",
+			storeUIDAnnotation:   "uid-1",
+		}))
+		a := newTraefikAllowlist(c, "kube-system", "sphinx-allowlist")
+
+		if err := a.Apply(ctx, []string{"203.0.113.7/32"}, 42, "uid-1"); err != nil {
+			t.Fatalf("Apply: %v", err)
+		}
+		if got := readSourceRange(t, c); !equalStrings(got, []string{"198.51.100.4/32"}) {
+			t.Errorf("sourceRange = %v, want the newer generation to survive", got)
+		}
+	})
+
+	// A recreated ConfigMap restarts the counter. Skipping here would freeze the
+	// allowlist forever, stale CIDRs and all.
+	t.Run("older generation from a different store proceeds", func(t *testing.T) {
+		c := newFakeClient(t, middlewareWith(t, []string{"198.51.100.4/32"}, map[string]string{
+			generationAnnotation: "43",
+			storeUIDAnnotation:   "uid-1",
+		}))
+		a := newTraefikAllowlist(c, "kube-system", "sphinx-allowlist")
+
+		if err := a.Apply(ctx, []string{"203.0.113.7/32"}, 1, "uid-2"); err != nil {
+			t.Fatalf("Apply: %v", err)
+		}
+		if got := readSourceRange(t, c); !equalStrings(got, []string{"203.0.113.7/32"}) {
+			t.Errorf("sourceRange = %v, want the recreated store's projection to win", got)
+		}
+	})
+
+	// A middleware from before this annotation existed carries no uid.
+	t.Run("older generation with no stamped uid proceeds", func(t *testing.T) {
+		c := newFakeClient(t, middlewareWith(t, []string{"198.51.100.4/32"}, map[string]string{
+			generationAnnotation: "43",
+		}))
+		a := newTraefikAllowlist(c, "kube-system", "sphinx-allowlist")
+
+		if err := a.Apply(ctx, []string{"203.0.113.7/32"}, 1, "uid-1"); err != nil {
+			t.Fatalf("Apply: %v", err)
+		}
+		if got := readSourceRange(t, c); !equalStrings(got, []string{"203.0.113.7/32"}) {
+			t.Errorf("sourceRange = %v, want the write to proceed", got)
+		}
+	})
+
+	t.Run("stamps the store uid it applied", func(t *testing.T) {
+		c := newFakeClient(t, middlewareWith(t, nil, nil))
+		a := newTraefikAllowlist(c, "kube-system", "sphinx-allowlist")
+
+		if err := a.Apply(ctx, []string{"203.0.113.7/32"}, 7, "uid-9"); err != nil {
+			t.Fatalf("Apply: %v", err)
+		}
+		u, err := c.Resource(middlewareGVR).Namespace("kube-system").
+			Get(ctx, "sphinx-allowlist", metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("get middleware: %v", err)
+		}
+		if got := stampedStoreUID(u); got != "uid-9" {
+			t.Errorf("stamped store uid = %q, want %q", got, "uid-9")
+		}
+	})
+}
+
 func TestAllowlistApplyEmptySet(t *testing.T) {
 	ctx := context.Background()
 	c := newFakeClient(t, middlewareWith(t, []string{"203.0.113.7/32"}, nil))
 	a := newTraefikAllowlist(c, "kube-system", "sphinx-allowlist")
 
-	if err := a.Apply(ctx, nil, 1); err != nil {
+	if err := a.Apply(ctx, nil, 1, "uid-1"); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
 	if got := readSourceRange(t, c); len(got) != 0 {
@@ -200,7 +268,7 @@ func TestAllowlistApplyRetriesOnConflict(t *testing.T) {
 	})
 
 	a := newTraefikAllowlist(c, "kube-system", "sphinx-allowlist")
-	if err := a.Apply(ctx, []string{"203.0.113.7/32"}, 1); err != nil {
+	if err := a.Apply(ctx, []string{"203.0.113.7/32"}, 1, "uid-1"); err != nil {
 		t.Fatalf("Apply should recover from a conflict: %v", err)
 	}
 	if got := readSourceRange(t, c); !equalStrings(got, []string{"203.0.113.7/32"}) {

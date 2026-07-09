@@ -548,3 +548,62 @@ func TestConfigMapStoreMigrate(t *testing.T) {
 		}
 	})
 }
+
+func TestStoreUIDLineage(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 7, 9, 10, 0, 0, 0, time.UTC)
+
+	t.Run("a persisted store gets a uid", func(t *testing.T) {
+		c := newFakeClient(t)
+		st := newConfigMapStore(c, "kube-system", "sphinx-users")
+		if _, err := st.Upsert(ctx, "alice@example.com", "203.0.113.7/32", now); err != nil {
+			t.Fatalf("Upsert: %v", err)
+		}
+		if readStore(t, c).UID == "" {
+			t.Error("a persisted store must carry a lineage uid")
+		}
+	})
+
+	t.Run("the uid survives later writes", func(t *testing.T) {
+		c := newFakeClient(t)
+		st := newConfigMapStore(c, "kube-system", "sphinx-users")
+		if _, err := st.Upsert(ctx, "alice@example.com", "203.0.113.7/32", now); err != nil {
+			t.Fatalf("Upsert: %v", err)
+		}
+		first := readStore(t, c).UID
+		if _, err := st.Upsert(ctx, "bob@example.com", "198.51.100.4/32", now); err != nil {
+			t.Fatalf("Upsert: %v", err)
+		}
+		if got := readStore(t, c).UID; got != first {
+			t.Errorf("uid = %q, want it stable at %q", got, first)
+		}
+	})
+
+	t.Run("a recreated store gets a different uid", func(t *testing.T) {
+		c1 := newFakeClient(t)
+		if _, err := newConfigMapStore(c1, "kube-system", "sphinx-users").
+			Upsert(ctx, "alice@example.com", "203.0.113.7/32", now); err != nil {
+			t.Fatalf("Upsert: %v", err)
+		}
+		c2 := newFakeClient(t)
+		if _, err := newConfigMapStore(c2, "kube-system", "sphinx-users").
+			Upsert(ctx, "alice@example.com", "203.0.113.7/32", now); err != nil {
+			t.Fatalf("Upsert: %v", err)
+		}
+		if readStore(t, c1).UID == readStore(t, c2).UID {
+			t.Error("independently created stores must not share a uid")
+		}
+	})
+
+	t.Run("migration assigns a uid", func(t *testing.T) {
+		c := newFakeClient(t, configMapWith(t, map[string]string{
+			"sphinx-abc123": `{"alice@example.com":{"email":"alice@example.com","ip":"203.0.113.7"}}`,
+		}))
+		if err := newConfigMapStore(c, "kube-system", "sphinx-users").Migrate(ctx, now); err != nil {
+			t.Fatalf("Migrate: %v", err)
+		}
+		if readStore(t, c).UID == "" {
+			t.Error("a migrated store must carry a lineage uid")
+		}
+	})
+}
