@@ -56,6 +56,11 @@ func (a *traefikAllowlist) EnsureExists(ctx context.Context) error {
 		"spec":       map[string]any{"ipAllowList": map[string]any{"sourceRange": []any{}}},
 	}}
 	if _, err := a.resource().Create(ctx, u, metav1.CreateOptions{}); err != nil {
+		// Replicas starting together race to create it. Losing means the
+		// middleware exists, which is all EnsureExists promises.
+		if k8serrors.IsAlreadyExists(err) {
+			return nil
+		}
 		return fmt.Errorf("create middleware: %w", err)
 	}
 	log.Printf("Created middleware %s/%s", a.namespace, a.name)
