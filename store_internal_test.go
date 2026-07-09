@@ -1,8 +1,20 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
 	"testing"
 	"time"
+
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/dynamic"
+	dynamicfake "k8s.io/client-go/dynamic/fake"
+	k8stesting "k8s.io/client-go/testing"
 )
 
 func TestStoreUpsert(t *testing.T) {
@@ -81,6 +93,209 @@ func TestStoreCIDRs(t *testing.T) {
 			if got[i] != want[i] {
 				t.Errorf("CIDRs()[%d] = %q, want %q", i, got[i], want[i])
 			}
+		}
+	})
+}
+
+// --- fake dynamic client helpers -------------------------------------------
+
+func testScheme(t *testing.T) (*runtime.Scheme, map[schema.GroupVersionResource]string) {
+	t.Helper()
+	return runtime.NewScheme(), map[schema.GroupVersionResource]string{
+		configMapGVR:  "ConfigMapList",
+		middlewareGVR: "MiddlewareList",
+	}
+}
+
+func newFakeClient(t *testing.T, objs ...runtime.Object) *dynamicfake.FakeDynamicClient {
+	t.Helper()
+	scheme, listKinds := testScheme(t)
+	return dynamicfake.NewSimpleDynamicClientWithCustomListKinds(scheme, listKinds, objs...)
+}
+
+func configMapWith(t *testing.T, data map[string]string) *unstructured.Unstructured {
+	t.Helper()
+	d := make(map[string]any, len(data))
+	for k, v := range data {
+		d[k] = v
+	}
+	return &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "v1",
+		"kind":       "ConfigMap",
+		"metadata":   map[string]any{"name": "sphinx-users", "namespace": "kube-system"},
+		"data":       d,
+	}}
+}
+
+func storeJSON(t *testing.T, s *Store) string {
+	t.Helper()
+	b, err := json.Marshal(s)
+	if err != nil {
+		t.Fatalf("marshal store: %v", err)
+	}
+	return string(b)
+}
+
+// readStore fetches users.json straight from the fake and decodes it.
+func readStore(t *testing.T, c dynamic.Interface) *Store {
+	t.Helper()
+	u, err := c.Resource(configMapGVR).Namespace("kube-system").
+		Get(context.Background(), "sphinx-users", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get configmap: %v", err)
+	}
+	s, err := decodeStore(u)
+	if err != nil {
+		t.Fatalf("decode store: %v", err)
+	}
+	return s
+}
+
+// --- tests ------------------------------------------------------------------
+
+func TestConfigMapStoreLoad(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 7, 9, 10, 0, 0, 0, time.UTC)
+
+	t.Run("absent configmap yields an empty store", func(t *testing.T) {
+		c := newFakeClient(t)
+		s, err := newConfigMapStore(c, "kube-system", "sphinx-users").Load(ctx)
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if len(s.Users) != 0 || s.Generation != 0 {
+			t.Errorf("Load() = %+v, want empty store", s)
+		}
+	})
+
+	t.Run("decodes an existing document", func(t *testing.T) {
+		seed := newStore()
+		seed.upsert("alice@example.com", "203.0.113.7/32", now)
+		c := newFakeClient(t, configMapWith(t, map[string]string{storeKey: storeJSON(t, seed)}))
+
+		s, err := newConfigMapStore(c, "kube-system", "sphinx-users").Load(ctx)
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if got := s.Users["alice@example.com"].CIDR; got != "203.0.113.7/32" {
+			t.Errorf("CIDR = %q, want %q", got, "203.0.113.7/32")
+		}
+		if s.Generation != 1 {
+			t.Errorf("Generation = %d, want 1", s.Generation)
+		}
+	})
+}
+
+func TestConfigMapStoreUpsert(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 7, 9, 10, 0, 0, 0, time.UTC)
+
+	t.Run("creates the configmap when absent", func(t *testing.T) {
+		c := newFakeClient(t)
+		st := newConfigMapStore(c, "kube-system", "sphinx-users")
+
+		s, err := st.Upsert(ctx, "alice@example.com", "203.0.113.7/32", now)
+		if err != nil {
+			t.Fatalf("Upsert: %v", err)
+		}
+		if s.Generation != 1 {
+			t.Errorf("Generation = %d, want 1", s.Generation)
+		}
+		if got := readStore(t, c).Users["alice@example.com"].CIDR; got != "203.0.113.7/32" {
+			t.Errorf("persisted CIDR = %q, want %q", got, "203.0.113.7/32")
+		}
+	})
+
+	t.Run("replaces a changed cidr in place", func(t *testing.T) {
+		seed := newStore()
+		seed.upsert("alice@example.com", "203.0.113.7/32", now)
+		c := newFakeClient(t, configMapWith(t, map[string]string{storeKey: storeJSON(t, seed)}))
+		st := newConfigMapStore(c, "kube-system", "sphinx-users")
+
+		if _, err := st.Upsert(ctx, "alice@example.com", "198.51.100.4/32", now); err != nil {
+			t.Fatalf("Upsert: %v", err)
+		}
+		got := readStore(t, c)
+		if len(got.Users) != 1 {
+			t.Fatalf("len(Users) = %d, want 1", len(got.Users))
+		}
+		if got.Users["alice@example.com"].CIDR != "198.51.100.4/32" {
+			t.Errorf("CIDR = %q, want the new one", got.Users["alice@example.com"].CIDR)
+		}
+	})
+
+	t.Run("unchanged cidr issues no write", func(t *testing.T) {
+		seed := newStore()
+		seed.upsert("alice@example.com", "203.0.113.7/32", now)
+		c := newFakeClient(t, configMapWith(t, map[string]string{storeKey: storeJSON(t, seed)}))
+
+		var updates int
+		c.PrependReactor("update", "configmaps", func(k8stesting.Action) (bool, runtime.Object, error) {
+			updates++
+			return false, nil, nil
+		})
+
+		st := newConfigMapStore(c, "kube-system", "sphinx-users")
+		if _, err := st.Upsert(ctx, "alice@example.com", "203.0.113.7/32", now); err != nil {
+			t.Fatalf("Upsert: %v", err)
+		}
+		if updates != 0 {
+			t.Errorf("update calls = %d, want 0 for an unchanged cidr", updates)
+		}
+	})
+
+	// The fake does not enforce resourceVersion, so the conflict is injected.
+	// The reactor also writes a competing user, proving the retry re-reads
+	// rather than clobbering.
+	t.Run("retries on conflict and re-reads", func(t *testing.T) {
+		seed := newStore()
+		c := newFakeClient(t, configMapWith(t, map[string]string{storeKey: storeJSON(t, seed)}))
+		st := newConfigMapStore(c, "kube-system", "sphinx-users")
+
+		var fired bool
+		c.PrependReactor("update", "configmaps", func(k8stesting.Action) (bool, runtime.Object, error) {
+			if fired {
+				return false, nil, nil
+			}
+			fired = true
+			// A competing replica lands first. This must go through the
+			// object tracker directly rather than c.Resource(...).Update:
+			// Fake.Invokes holds a non-reentrant lock for the whole reactor
+			// call, so a nested call back through the dynamic client here
+			// would deadlock against the outer Update that is dispatching
+			// this reactor.
+			competitor := newStore()
+			competitor.upsert("bob@example.com", "198.51.100.4/32", now)
+			cm := configMapWith(t, map[string]string{storeKey: storeJSON(t, competitor)})
+			if err := c.Tracker().Update(configMapGVR, cm, "kube-system"); err != nil {
+				t.Errorf("competitor update: %v", err)
+			}
+			return true, nil, k8serrors.NewConflict(
+				schema.GroupResource{Resource: "configmaps"}, "sphinx-users", errors.New("stale"))
+		})
+
+		if _, err := st.Upsert(ctx, "alice@example.com", "203.0.113.7/32", now); err != nil {
+			t.Fatalf("Upsert should recover from a conflict: %v", err)
+		}
+		got := readStore(t, c)
+		if _, ok := got.Users["bob@example.com"]; !ok {
+			t.Error("competing writer's record was clobbered; the retry did not re-read")
+		}
+		if _, ok := got.Users["alice@example.com"]; !ok {
+			t.Error("our record was not written")
+		}
+	})
+
+	t.Run("gives up after maxRetries conflicts", func(t *testing.T) {
+		c := newFakeClient(t, configMapWith(t, map[string]string{storeKey: storeJSON(t, newStore())}))
+		c.PrependReactor("update", "configmaps", func(k8stesting.Action) (bool, runtime.Object, error) {
+			return true, nil, k8serrors.NewConflict(
+				schema.GroupResource{Resource: "configmaps"}, "sphinx-users", errors.New("stale"))
+		})
+		st := newConfigMapStore(c, "kube-system", "sphinx-users")
+
+		if _, err := st.Upsert(ctx, "alice@example.com", "203.0.113.7/32", now); err == nil {
+			t.Fatal("Upsert should fail after exhausting retries")
 		}
 	})
 }
