@@ -478,6 +478,21 @@ func TestConfigMapStoreUpsert(t *testing.T) {
 			t.Fatal("Upsert should fail after exhausting retries")
 		}
 	})
+
+	t.Run("abandons the retry loop when ctx is cancelled", func(t *testing.T) {
+		c := newFakeClient(t, configMapWith(t, map[string]string{storeKey: storeJSON(t, newStore())}))
+		cancelCtx, cancel := context.WithCancel(context.Background())
+		c.PrependReactor("update", "configmaps", func(k8stesting.Action) (bool, runtime.Object, error) {
+			cancel() // the caller gives up while we are mid-retry
+			return true, nil, k8serrors.NewConflict(
+				schema.GroupResource{Resource: "configmaps"}, "sphinx-users", errors.New("stale"))
+		})
+		st := newConfigMapStore(c, "kube-system", "sphinx-users")
+
+		if _, err := st.Upsert(cancelCtx, "alice@example.com", "203.0.113.7/32", now); !errors.Is(err, context.Canceled) {
+			t.Fatalf("Upsert error = %v, want context.Canceled; a cancelled caller must not wait out the backoff", err)
+		}
+	})
 }
 ```
 
@@ -661,7 +676,16 @@ func (c *configMapStore) Upsert(ctx context.Context, email, cidr string, now tim
 			}
 		}
 		last = err
-		time.Sleep(backoff(attempt))
+		// No point sleeping after the final attempt, and a cancelled caller
+		// must not wait out a backoff it will never use.
+		if attempt == maxRetries-1 {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(backoff(attempt)):
+		}
 	}
 	return nil, fmt.Errorf("upsert %s: exceeded %d retries: %w", email, maxRetries, last)
 }
@@ -1344,7 +1368,16 @@ func (a *traefikAllowlist) Apply(ctx context.Context, cidrs []string, generation
 			return fmt.Errorf("update middleware: %w", err)
 		}
 		last = err
-		time.Sleep(backoff(attempt))
+		// No point sleeping after the final attempt, and a cancelled caller
+		// must not wait out a backoff it will never use.
+		if attempt == maxRetries-1 {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(backoff(attempt)):
+		}
 	}
 	return fmt.Errorf("apply allowlist: exceeded %d retries: %w", maxRetries, last)
 }
