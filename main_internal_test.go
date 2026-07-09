@@ -223,3 +223,26 @@ func TestHostCIDR(t *testing.T) {
 		})
 	}
 }
+
+func TestCatchAllProxies(t *testing.T) {
+	tests := []struct {
+		name string
+		give []string
+		want bool
+	}{
+		{name: "empty", give: nil, want: false},
+		{name: "narrow ipv4", give: []string{"10.42.0.0/16"}, want: false},
+		{name: "loopback", give: []string{"127.0.0.1/32"}, want: false},
+		{name: "ipv4 catch-all", give: []string{"0.0.0.0/0"}, want: true},
+		{name: "ipv6 catch-all", give: []string{"::/0"}, want: true},
+		{name: "catch-all hidden among narrow entries", give: []string{"10.42.0.0/16", "0.0.0.0/0"}, want: true},
+		{name: "whitespace tolerated", give: []string{" 0.0.0.0/0 "}, want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := catchAllProxies(tt.give); got != tt.want {
+				t.Errorf("catchAllProxies(%v) = %v, want %v", tt.give, got, tt.want)
+			}
+		})
+	}
+}

@@ -35,7 +35,7 @@ All flags can be set via environment variables by uppercasing the flag name, rep
 | `--configmap-name`      | `SPHINX_CONFIGMAP_NAME`       | `sphinx-users`     | No       | Name of the `ConfigMap` used to persist user registrations.                 |
 | `--reconcile-interval`  | `SPHINX_RECONCILE_INTERVAL`   | `60s`              | No       | How often the allowlist is re-projected from the store to repair drift.     |
 | `--port`                | `SPHINX_PORT`                 | `8080`             | No       | Port the HTTP server listens on.                                            |
-| `--trusted-proxies`     | `SPHINX_TRUSTED_PROXIES`      | —                  | No       | Comma-separated list of trusted proxy CIDRs (passed to Gin).               |
+| `--trusted-proxies`     | `SPHINX_TRUSTED_PROXIES`      | —                  | Yes, behind a proxy | CIDRs of the reverse proxies in front of Sphinx. The client IP is taken from the first `X-Forwarded-For` entry that is not one of these. **Do not use `0.0.0.0/0`** — it trusts every address, which lets any caller choose the CIDR that gets allowlisted. |
 | `--kubeconfig`          | `SPHINX_KUBECONFIG`           | —                  | No       | Path to a kubeconfig file. Auto-detected: in-cluster config when running as a pod, otherwise `~/.kube/config`. |
 
 ## Running locally
@@ -47,10 +47,18 @@ make dev
 This runs:
 
 ```sh
-go run . --middleware-name sphinx-allowlist --middleware-namespace kube-system --trusted-proxies 0.0.0.0/0
+go run . --middleware-name sphinx-dev --configmap-name sphinx-dev-users --middleware-namespace kube-system --trusted-proxies 127.0.0.1/32 --reconcile-interval 30s
 ```
 
-Sphinx will use `~/.kube/config` automatically when running outside a cluster.
+Sphinx will use `~/.kube/config` automatically when running outside a cluster. The local target uses scratch resources (`sphinx-dev`, `sphinx-dev-users`) so a local run cannot rewrite a live allowlist.
+
+## Security
+
+Sphinx writes the caller's address into an IP allowlist, so the address it derives must not be attacker-controlled.
+
+The client IP comes from gin's `ClientIP()`, which walks `X-Forwarded-For` from right to left and returns the first entry that is not listed in `--trusted-proxies`. Set `--trusted-proxies` to the CIDR of your reverse proxy — for a Traefik pod, that is the cluster's pod CIDR.
+
+A catch-all value such as `0.0.0.0/0` marks every address as a trusted proxy. Gin then falls through to the leftmost `X-Forwarded-For` entry, which any client can set, and an attacker can have an arbitrary CIDR allowlisted. Sphinx logs a warning at startup if it detects this, but it cannot refuse to run — some deployments legitimately terminate TLS elsewhere.
 
 ## Deployment
 

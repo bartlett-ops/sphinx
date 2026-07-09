@@ -59,8 +59,11 @@ func main() {
 	if *trustedProxiesRaw != "" {
 		trustedProxies = strings.Split(*trustedProxiesRaw, ",")
 	}
-	if len(trustedProxies) == 0 {
-		log.Print("WARNING: trusted-proxies is empty, so the client IP is taken from the connection, not X-Forwarded-For. Behind a proxy every user will register the proxy's address.")
+	switch {
+	case len(trustedProxies) == 0:
+		log.Print("WARNING: trusted-proxies is unset, so the client IP is taken from the connection. Behind a reverse proxy every user will register the proxy's own address.")
+	case catchAllProxies(trustedProxies):
+		log.Print("WARNING: trusted-proxies trusts every address, so X-Forwarded-For is client-controlled and any caller can choose which CIDR gets allowlisted. Set it to your reverse proxy's CIDR.")
 	}
 
 	cfg, err := resolveKubeConfig(*kubeconfig)
@@ -176,6 +179,19 @@ func hostCIDR(ip string) (string, error) {
 	// BitLen is 128. Unmapping keeps it a /32 rather than widening it to a /128.
 	addr = addr.Unmap()
 	return netip.PrefixFrom(addr, addr.BitLen()).String(), nil
+}
+
+// catchAllProxies reports whether the trusted-proxy set trusts every address.
+// Gin then walks X-Forwarded-For to its leftmost entry, which any caller can
+// set, so the allowlisted CIDR becomes client-controlled.
+func catchAllProxies(cidrs []string) bool {
+	for _, c := range cidrs {
+		switch strings.TrimSpace(c) {
+		case "0.0.0.0/0", "::/0":
+			return true
+		}
+	}
+	return false
 }
 
 func getUsers(store UserStore) gin.HandlerFunc {
