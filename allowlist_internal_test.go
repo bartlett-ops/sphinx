@@ -64,6 +64,24 @@ func equalStrings(a, b []string) bool {
 
 // The single assertion that would have caught the reported bug. unionStrings
 // fails it.
+func TestAllowlistCheck(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("absent middleware is a failure", func(t *testing.T) {
+		c := newFakeClient(t)
+		if err := newTraefikAllowlist(c, "kube-system", "sphinx-allowlist").Check(ctx); err == nil {
+			t.Error("Check on absent middleware = nil, want error; EnsureExists created it at startup")
+		}
+	})
+
+	t.Run("present middleware is reachable", func(t *testing.T) {
+		c := newFakeClient(t, middlewareWith(t, []string{"203.0.113.7/32"}, nil))
+		if err := newTraefikAllowlist(c, "kube-system", "sphinx-allowlist").Check(ctx); err != nil {
+			t.Errorf("Check = %v, want nil", err)
+		}
+	})
+}
+
 func TestAllowlistApplyReplacesRatherThanUnions(t *testing.T) {
 	ctx := context.Background()
 	c := newFakeClient(t, middlewareWith(t, []string{"203.0.113.7/32"}, nil))

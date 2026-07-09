@@ -67,6 +67,15 @@ func (a *traefikAllowlist) EnsureExists(ctx context.Context) error {
 	return nil
 }
 
+// Check reports whether the Middleware is reachable, for the readiness probe.
+// Unlike the ConfigMap, it must exist: EnsureExists created it at startup.
+func (a *traefikAllowlist) Check(ctx context.Context) error {
+	if _, err := a.resource().Get(ctx, a.name, metav1.GetOptions{}); err != nil {
+		return fmt.Errorf("get middleware: %w", err)
+	}
+	return nil
+}
+
 // stampedGeneration reads the generation last applied. An absent or malformed
 // annotation reads as 0, so the next Apply always proceeds.
 func stampedGeneration(u *unstructured.Unstructured) int64 {

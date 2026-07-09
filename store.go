@@ -134,6 +134,15 @@ func (c *configMapStore) Load(ctx context.Context) (*Store, error) {
 	return decodeStore(u)
 }
 
+// Check reports whether the ConfigMap is reachable, for the readiness probe.
+// Absence is not a failure: a fresh install has no users yet.
+func (c *configMapStore) Check(ctx context.Context) error {
+	if _, err := c.get(ctx); err != nil && !k8serrors.IsNotFound(err) {
+		return fmt.Errorf("get configmap: %w", err)
+	}
+	return nil
+}
+
 func (c *configMapStore) create(ctx context.Context, s *Store) error {
 	b, err := json.Marshal(s)
 	if err != nil {

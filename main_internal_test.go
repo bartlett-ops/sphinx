@@ -1,6 +1,85 @@
 package main
 
-import "testing"
+import (
+	"context"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/gin-gonic/gin"
+)
+
+type stubChecker struct{ err error }
+
+func (s stubChecker) Check(context.Context) error { return s.err }
+
+func TestReadiness(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	// A reconciler that has succeeded just now.
+	healthy := func(t *testing.T) *Reconciler {
+		t.Helper()
+		r := newReconciler(&fakeStore{store: newStore()}, &fakeAllowlist{})
+		if err := r.Reconcile(context.Background()); err != nil {
+			t.Fatalf("Reconcile: %v", err)
+		}
+		return r
+	}
+
+	tests := []struct {
+		name           string
+		giveReconciler func(*testing.T) *Reconciler
+		giveAllowlist  checker
+		giveStore      checker
+		wantStatus     int
+	}{
+		{
+			name:           "ready",
+			giveReconciler: healthy,
+			giveAllowlist:  stubChecker{},
+			giveStore:      stubChecker{},
+			wantStatus:     http.StatusOK,
+		},
+		{
+			name:           "never reconciled",
+			giveReconciler: func(*testing.T) *Reconciler { return newReconciler(&fakeStore{store: newStore()}, &fakeAllowlist{}) },
+			giveAllowlist:  stubChecker{},
+			giveStore:      stubChecker{},
+			wantStatus:     http.StatusServiceUnavailable,
+		},
+		{
+			// The failure mode a freshness check alone cannot see.
+			name:           "middleware unreachable despite a recent reconcile",
+			giveReconciler: healthy,
+			giveAllowlist:  stubChecker{err: errors.New("connection refused")},
+			giveStore:      stubChecker{},
+			wantStatus:     http.StatusServiceUnavailable,
+		},
+		{
+			name:           "configmap unreachable despite a recent reconcile",
+			giveReconciler: healthy,
+			giveAllowlist:  stubChecker{},
+			giveStore:      stubChecker{err: errors.New("connection refused")},
+			wantStatus:     http.StatusServiceUnavailable,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			router := gin.New()
+			router.GET("/ready", readiness(tt.giveReconciler(t), tt.giveAllowlist, tt.giveStore, time.Minute))
+
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/ready", nil))
+
+			if w.Code != tt.wantStatus {
+				t.Errorf("GET /ready = %d, want %d (body: %s)", w.Code, tt.wantStatus, w.Body.String())
+			}
+		})
+	}
+}
 
 func TestHostCIDR(t *testing.T) {
 	tests := []struct {

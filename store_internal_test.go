@@ -186,6 +186,24 @@ func TestConfigMapStoreLoad(t *testing.T) {
 	})
 }
 
+func TestConfigMapStoreCheck(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("absent configmap is not a failure", func(t *testing.T) {
+		c := newFakeClient(t)
+		if err := newConfigMapStore(c, "kube-system", "sphinx-users").Check(ctx); err != nil {
+			t.Errorf("Check on absent configmap = %v, want nil; a fresh install has no users", err)
+		}
+	})
+
+	t.Run("present configmap is reachable", func(t *testing.T) {
+		c := newFakeClient(t, configMapWith(t, map[string]string{storeKey: storeJSON(t, newStore())}))
+		if err := newConfigMapStore(c, "kube-system", "sphinx-users").Check(ctx); err != nil {
+			t.Errorf("Check = %v, want nil", err)
+		}
+	})
+}
+
 func TestConfigMapStoreUpsert(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 7, 9, 10, 0, 0, 0, time.UTC)
