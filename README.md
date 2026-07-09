@@ -14,12 +14,15 @@ Multiple Sphinx replicas co-exist safely. All replicas share a single `ConfigMap
 
 ## API
 
-| Method | Path     | Description                                      |
-|--------|----------|--------------------------------------------------|
-| `GET`  | `/users` | Returns the current in-memory user map as JSON.  |
-| `POST` | `/users` | Registers the caller's IP against their email.   |
+| Method | Path      | Description                                                                                                                 |
+|--------|-----------|-----------------------------------------------------------------------------------------------------------------------------|
+| `GET`  | `/auth`   | Registers the caller's CIDR against their email. This is the Traefik `ForwardAuth` entry point.                              |
+| `POST` | `/users`  | Identical to `GET /auth`, retained for backwards compatibility.                                                              |
+| `GET`  | `/users`  | Returns the current user records as JSON, read from the `ConfigMap`.                                                        |
+| `GET`  | `/health` | Liveness probe. Returns `200` whenever the process is serving.                                                               |
+| `GET`  | `/ready`  | Readiness probe. Returns `200` only when a reconcile has succeeded recently and both the `Middleware` and `ConfigMap` are reachable. |
 
-`POST /users` reads the `X-Forwarded-User` request header for the email address and derives the client IP from `X-Forwarded-For` (first entry) or the direct connection address.
+`GET /auth` and `POST /users` read the `X-Forwarded-User` request header for the email address, and derive the client IP from `X-Forwarded-For` (first entry) or the direct connection address. They return `201 Created` when the registration was written, and `200 OK` when the CIDR was unchanged and the request was served from the pod's write-skip cache.
 
 ## Configuration
 
