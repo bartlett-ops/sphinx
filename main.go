@@ -59,6 +59,9 @@ func main() {
 	if *trustedProxiesRaw != "" {
 		trustedProxies = strings.Split(*trustedProxiesRaw, ",")
 	}
+	if len(trustedProxies) == 0 {
+		log.Print("WARNING: trusted-proxies is empty, so the client IP is taken from the connection, not X-Forwarded-For. Behind a proxy every user will register the proxy's address.")
+	}
 
 	cfg, err := resolveKubeConfig(*kubeconfig)
 	if err != nil {
@@ -162,16 +165,6 @@ func resolveKubeConfig(override string) (*rest.Config, error) {
 	return clientcmd.BuildConfigFromFlags("", filepath.Join(home, ".kube", "config"))
 }
 
-func resolveClientIP(c *gin.Context) string {
-	if xff := c.GetHeader("X-Forwarded-For"); xff != "" {
-		if i := strings.IndexByte(xff, ','); i != -1 {
-			return strings.TrimSpace(xff[:i])
-		}
-		return strings.TrimSpace(xff)
-	}
-	return c.ClientIP()
-}
-
 // hostCIDR converts a bare IP address into the CIDR covering only that host:
 // /32 for IPv4, /128 for IPv6.
 func hostCIDR(ip string) (string, error) {
@@ -204,7 +197,7 @@ func auth(r *Reconciler) gin.HandlerFunc {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Missing X-Forwarded-User header"})
 			return
 		}
-		cidr, err := hostCIDR(resolveClientIP(c))
+		cidr, err := hostCIDR(c.ClientIP())
 		if err != nil {
 			log.Printf("Failed to resolve client ip for %s: %v", email, err)
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Unresolvable client IP"})

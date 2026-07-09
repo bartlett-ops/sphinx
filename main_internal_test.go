@@ -11,6 +11,80 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+// Gin's ClientIP walks X-Forwarded-For right-to-left, skipping trusted proxies,
+// so an attacker-injected leftmost entry is ignored.
+func TestClientIPHonoursTrustedProxies(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	tests := []struct {
+		name           string
+		giveTrusted    []string
+		giveRemoteAddr string
+		giveXFF        string
+		want           string
+	}{
+		{
+			name:           "single hop from a trusted proxy",
+			giveTrusted:    []string{"10.42.0.0/16"},
+			giveRemoteAddr: "10.42.0.154:34567",
+			giveXFF:        "92.40.212.206",
+			want:           "92.40.212.206/32",
+		},
+		{
+			// The spoofed leftmost entry must be ignored.
+			name:           "injected leftmost entry is ignored",
+			giveTrusted:    []string{"10.42.0.0/16"},
+			giveRemoteAddr: "10.42.0.154:34567",
+			giveXFF:        "8.8.8.8, 92.40.212.206",
+			want:           "92.40.212.206/32",
+		},
+		{
+			name:           "ipv6 client",
+			giveTrusted:    []string{"10.42.0.0/16"},
+			giveRemoteAddr: "10.42.0.154:34567",
+			giveXFF:        "2001:db8::1",
+			want:           "2001:db8::1/128",
+		},
+		{
+			name:           "untrusted direct connection ignores the header entirely",
+			giveTrusted:    []string{"10.42.0.0/16"},
+			giveRemoteAddr: "203.0.113.9:5555",
+			giveXFF:        "8.8.8.8",
+			want:           "203.0.113.9/32",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var got string
+			router := gin.New()
+			if err := router.SetTrustedProxies(tt.giveTrusted); err != nil {
+				t.Fatalf("SetTrustedProxies: %v", err)
+			}
+			router.GET("/x", func(c *gin.Context) {
+				cidr, err := hostCIDR(c.ClientIP())
+				if err != nil {
+					t.Errorf("hostCIDR: %v", err)
+					return
+				}
+				got = cidr
+				c.Status(http.StatusOK)
+			})
+
+			req := httptest.NewRequest(http.MethodGet, "/x", nil)
+			req.RemoteAddr = tt.giveRemoteAddr
+			if tt.giveXFF != "" {
+				req.Header.Set("X-Forwarded-For", tt.giveXFF)
+			}
+			router.ServeHTTP(httptest.NewRecorder(), req)
+
+			if got != tt.want {
+				t.Errorf("client CIDR = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 type stubChecker struct{ err error }
 
 func (s stubChecker) Check(context.Context) error { return s.err }
