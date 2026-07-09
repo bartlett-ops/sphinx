@@ -877,6 +877,48 @@ func TestConfigMapStoreMigrate(t *testing.T) {
 			t.Fatalf("Migrate on absent configmap should succeed: %v", err)
 		}
 	})
+
+	// Every replica but one loses the migration race on the cutover rollout.
+	// Losing means the work is already done, not that startup failed.
+	t.Run("a lost migration race is not an error", func(t *testing.T) {
+		c := newFakeClient(t, configMapWith(t, map[string]string{
+			"sphinx-abc123": legacyBlob(map[string]string{"alice@example.com": "203.0.113.7"}),
+		}))
+		st := newConfigMapStore(c, "kube-system", "sphinx-users")
+
+		c.PrependReactor("update", "configmaps", func(k8stesting.Action) (bool, runtime.Object, error) {
+			// The winning replica writes users.json first. Staged through the
+			// tracker: a reactor must not call back into the client.
+			winner := newStore()
+			winner.upsert("alice@example.com", "203.0.113.7/32", now)
+			cm := configMapWith(t, map[string]string{storeKey: storeJSON(t, winner)})
+			if err := c.Tracker().Update(configMapGVR, cm, "kube-system"); err != nil {
+				t.Errorf("winner update: %v", err)
+			}
+			return true, nil, k8serrors.NewConflict(
+				schema.GroupResource{Resource: "configmaps"}, "sphinx-users", errors.New("stale"))
+		})
+
+		if err := st.Migrate(ctx, now); err != nil {
+			t.Fatalf("losing the migration race must not be an error: %v", err)
+		}
+	})
+
+	t.Run("a conflict that did not migrate still surfaces", func(t *testing.T) {
+		c := newFakeClient(t, configMapWith(t, map[string]string{
+			"sphinx-abc123": legacyBlob(map[string]string{"alice@example.com": "203.0.113.7"}),
+		}))
+		st := newConfigMapStore(c, "kube-system", "sphinx-users")
+
+		c.PrependReactor("update", "configmaps", func(k8stesting.Action) (bool, runtime.Object, error) {
+			return true, nil, k8serrors.NewConflict(
+				schema.GroupResource{Resource: "configmaps"}, "sphinx-users", errors.New("stale"))
+		})
+
+		if err := st.Migrate(ctx, now); err == nil {
+			t.Fatal("a conflict with no migrated document must surface as an error")
+		}
+	})
 }
 ```
 
@@ -966,10 +1008,31 @@ func (c *configMapStore) Migrate(ctx context.Context, now time.Time) error {
 		return fmt.Errorf("set data: %w", err)
 	}
 	if _, err := c.resource().Update(ctx, u, metav1.UpdateOptions{}); err != nil {
+		// Losing the migration race is the expected outcome for every replica
+		// but one. It means the work is already done, not that startup failed.
+		if k8serrors.IsConflict(err) && c.migrated(ctx) {
+			log.Printf("Migration: another replica migrated first")
+			return nil
+		}
 		return fmt.Errorf("update configmap: %w", err)
 	}
 	log.Printf("Migration: wrote %d users, removed %d legacy keys", len(s.Users), len(data))
 	return nil
+}
+
+// migrated reports whether users.json now exists, meaning another replica won
+// the migration race.
+func (c *configMapStore) migrated(ctx context.Context) bool {
+	u, err := c.get(ctx)
+	if err != nil {
+		return false
+	}
+	data, found, err := unstructured.NestedStringMap(u.Object, "data")
+	if err != nil || !found {
+		return false
+	}
+	_, ok := data[storeKey]
+	return ok
 }
 ```
 
