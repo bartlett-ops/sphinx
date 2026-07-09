@@ -273,10 +273,22 @@ transient API server failure must not take down the auth path; the next tick con
 
 **Readiness becomes stricter.** The current `/ready` (`main.go:116`) checks only that the
 middleware and ConfigMap exist, so a pod reports ready before it has ever reconciled and
-can serve auth requests with an empty view of the world. The new probe additionally
+can serve auth requests with an empty view of the world. The new probe **additionally**
 requires that the initial reconcile has completed and that the last successful reconcile
 occurred within `3 × reconcileInterval`. A pod that has silently lost the ability to write
 the allowlist falls out of the Service.
+
+The word *additionally* is load-bearing. The reconcile-freshness check does **not** subsume
+the live `Get` probes and must not replace them. `Healthy` reports on the last *successful*
+reconcile, so a pod whose API access breaks immediately after a success keeps reporting
+ready for up to `3 × reconcileInterval` — three minutes at the default. The live `Get`
+against each resource fails on the very next probe. Only together are the two strictly
+stronger than the retired probe.
+
+**Shutdown is graceful.** `SIGTERM` cancels the root context, which stops the reconcile
+loop and triggers `http.Server.Shutdown`, draining in-flight requests. Blocking in
+`router.Run` instead would leave the server accepting auth traffic against a frozen
+reconciler until the kubelet's grace period expired and it was killed.
 
 ## RBAC
 

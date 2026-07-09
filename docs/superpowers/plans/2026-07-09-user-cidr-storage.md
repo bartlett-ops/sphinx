@@ -608,6 +608,15 @@ func (c *configMapStore) Load(ctx context.Context) (*Store, error) {
 	return decodeStore(u)
 }
 
+// Check reports whether the ConfigMap is reachable, for the readiness probe.
+// Absence is not a failure: a fresh install has no users yet.
+func (c *configMapStore) Check(ctx context.Context) error {
+	if _, err := c.get(ctx); err != nil && !k8serrors.IsNotFound(err) {
+		return fmt.Errorf("get configmap: %w", err)
+	}
+	return nil
+}
+
 func (c *configMapStore) create(ctx context.Context, s *Store) error {
 	b, err := json.Marshal(s)
 	if err != nil {
@@ -1413,6 +1422,15 @@ func (a *traefikAllowlist) EnsureExists(ctx context.Context) error {
 	return nil
 }
 
+// Check reports whether the Middleware is reachable, for the readiness probe.
+// Unlike the ConfigMap, it must exist: EnsureExists created it at startup.
+func (a *traefikAllowlist) Check(ctx context.Context) error {
+	if _, err := a.resource().Get(ctx, a.name, metav1.GetOptions{}); err != nil {
+		return fmt.Errorf("get middleware: %w", err)
+	}
+	return nil
+}
+
 // stampedGeneration reads the generation last applied. An absent or malformed
 // annotation reads as 0, so the next Apply always proceeds.
 func stampedGeneration(u *unstructured.Unstructured) int64 {
@@ -1950,6 +1968,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -2044,23 +2063,51 @@ func main() {
 		log.Fatal(err)
 	}
 	router.GET("/health", func(c *gin.Context) { c.Status(http.StatusOK) })
-	router.GET("/ready", readiness(reconciler, *reconcileInterval))
+	router.GET("/ready", readiness(reconciler, allowlist, store, *reconcileInterval))
 	router.GET("/users", getUsers(store))
 	router.POST("/users", auth(reconciler)) // Backwards compatibility
 	router.GET("/auth", auth(reconciler))   // Backwards compatibility
 
-	if err := router.Run(fmt.Sprintf(":%d", *port)); err != nil {
+	srv := &http.Server{Addr: fmt.Sprintf(":%d", *port), Handler: router}
+	go func() {
+		<-ctx.Done()
+		// SIGTERM: stop accepting, drain in-flight requests. Blocking in
+		// router.Run instead would serve auth traffic against a frozen
+		// reconciler until the kubelet killed us.
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("Graceful shutdown failed: %v", err)
+		}
+	}()
+	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}
 }
 
-// readiness reports ready only once a reconcile has succeeded recently. This
-// subsumes probing the middleware and ConfigMap directly: Reconcile reads one
-// and writes the other, so an unreachable resource already fails it.
-func readiness(r *Reconciler, interval time.Duration) gin.HandlerFunc {
+// checker reports whether a dependency is reachable.
+type checker interface {
+	Check(ctx context.Context) error
+}
+
+// readiness requires both a recent successful reconcile and reachable
+// dependencies. The freshness check does not subsume the live reads: Healthy
+// reports on the last *successful* reconcile, so a pod whose API access breaks
+// right after one keeps reporting ready for up to 3 intervals. Together they
+// are strictly stronger than the retired probe; neither is alone.
+func readiness(r *Reconciler, allowlist, store checker, interval time.Duration) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if !r.Healthy(time.Now(), 3*interval) {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "no successful reconcile within 3 intervals"})
+			return
+		}
+		ctx := c.Request.Context()
+		if err := allowlist.Check(ctx); err != nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": fmt.Sprintf("middleware unavailable: %v", err)})
+			return
+		}
+		if err := store.Check(ctx); err != nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": fmt.Sprintf("configmap unavailable: %v", err)})
 			return
 		}
 		c.Status(http.StatusOK)
