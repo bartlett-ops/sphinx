@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"sort"
 	"time"
 
@@ -213,4 +214,86 @@ func (c *configMapStore) Upsert(ctx context.Context, email, cidr string, now tim
 		}
 	}
 	return nil, fmt.Errorf("upsert %s: exceeded %d retries: %w", email, maxRetries, last)
+}
+
+// legacyUser is the record shape of the retired pod-sharded format. It holds a
+// bare IP, not a CIDR.
+type legacyUser struct {
+	Email string `json:"email"`
+	IP    string `json:"ip"`
+}
+
+// Migrate rewrites the retired hostname-keyed layout into a single users.json
+// document, dropping the legacy keys in the same atomic update. It is a no-op
+// once users.json exists, or when the ConfigMap is absent.
+//
+// A user whose pod blobs disagree about their IP is dropped: the legacy format
+// carries no timestamp, so the current CIDR cannot be determined, and keeping
+// the wrong one would preserve exactly the staleness this redesign removes.
+func (c *configMapStore) Migrate(ctx context.Context, now time.Time) error {
+	u, err := c.get(ctx)
+	if err != nil {
+		if k8serrors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("get configmap: %w", err)
+	}
+
+	data, found, err := unstructured.NestedStringMap(u.Object, "data")
+	if err != nil {
+		return fmt.Errorf("read data: %w", err)
+	}
+	if !found || len(data) == 0 {
+		return nil
+	}
+	if _, ok := data[storeKey]; ok {
+		return nil
+	}
+
+	seen := make(map[string]map[string]struct{})
+	for key, raw := range data {
+		var blob map[string]legacyUser
+		if err := json.Unmarshal([]byte(raw), &blob); err != nil {
+			log.Printf("Migration: skipping unparseable legacy key %q: %v", key, err)
+			continue
+		}
+		for email, lu := range blob {
+			cidr, err := hostCIDR(lu.IP)
+			if err != nil {
+				log.Printf("Migration: skipping user %s with unparseable ip %q: %v", email, lu.IP, err)
+				continue
+			}
+			if seen[email] == nil {
+				seen[email] = make(map[string]struct{})
+			}
+			seen[email][cidr] = struct{}{}
+		}
+	}
+
+	s := newStore()
+	for email, cidrs := range seen {
+		if len(cidrs) != 1 {
+			log.Printf("Migration: dropping user %s: %d conflicting CIDRs across legacy keys, re-authentication required", email, len(cidrs))
+			continue
+		}
+		for cidr := range cidrs {
+			s.Users[email] = Record{CIDR: cidr, UpdatedAt: now}
+		}
+	}
+	s.Generation = 1
+
+	b, err := json.Marshal(s)
+	if err != nil {
+		return fmt.Errorf("marshal store: %w", err)
+	}
+	// Replace data wholesale: writes users.json and removes every legacy key in
+	// one update, which is atomic because it is a single object.
+	if err := unstructured.SetNestedStringMap(u.Object, map[string]string{storeKey: string(b)}, "data"); err != nil {
+		return fmt.Errorf("set data: %w", err)
+	}
+	if _, err := c.resource().Update(ctx, u, metav1.UpdateOptions{}); err != nil {
+		return fmt.Errorf("update configmap: %w", err)
+	}
+	log.Printf("Migration: wrote %d users, removed %d legacy keys", len(s.Users), len(data))
+	return nil
 }

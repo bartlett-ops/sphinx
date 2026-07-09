@@ -314,3 +314,137 @@ func TestConfigMapStoreUpsert(t *testing.T) {
 		}
 	})
 }
+
+func TestConfigMapStoreMigrate(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 7, 9, 10, 0, 0, 0, time.UTC)
+
+	legacyBlob := func(pairs map[string]string) string {
+		t.Helper()
+		m := make(map[string]legacyUser, len(pairs))
+		for email, ip := range pairs {
+			m[email] = legacyUser{Email: email, IP: ip}
+		}
+		b, err := json.Marshal(m)
+		if err != nil {
+			t.Fatalf("marshal legacy blob: %v", err)
+		}
+		return string(b)
+	}
+
+	t.Run("merges disjoint pod blobs and drops legacy keys", func(t *testing.T) {
+		c := newFakeClient(t, configMapWith(t, map[string]string{
+			"sphinx-abc123": legacyBlob(map[string]string{"alice@example.com": "203.0.113.7"}),
+			"sphinx-def456": legacyBlob(map[string]string{"bob@example.com": "198.51.100.4"}),
+		}))
+		st := newConfigMapStore(c, "kube-system", "sphinx-users")
+
+		if err := st.Migrate(ctx, now); err != nil {
+			t.Fatalf("Migrate: %v", err)
+		}
+
+		got := readStore(t, c)
+		if len(got.Users) != 2 {
+			t.Fatalf("len(Users) = %d, want 2", len(got.Users))
+		}
+		if got.Users["alice@example.com"].CIDR != "203.0.113.7/32" {
+			t.Errorf("alice CIDR = %q, want 203.0.113.7/32", got.Users["alice@example.com"].CIDR)
+		}
+		if !got.Users["alice@example.com"].UpdatedAt.Equal(now) {
+			t.Errorf("alice UpdatedAt = %v, want migration time %v", got.Users["alice@example.com"].UpdatedAt, now)
+		}
+
+		u, err := c.Resource(configMapGVR).Namespace("kube-system").
+			Get(ctx, "sphinx-users", metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("get configmap: %v", err)
+		}
+		data, _, err := unstructured.NestedStringMap(u.Object, "data")
+		if err != nil {
+			t.Fatalf("read data: %v", err)
+		}
+		if len(data) != 1 {
+			t.Errorf("data keys = %v, want only %s", data, storeKey)
+		}
+	})
+
+	t.Run("drops a user whose blobs disagree", func(t *testing.T) {
+		c := newFakeClient(t, configMapWith(t, map[string]string{
+			"sphinx-abc123": legacyBlob(map[string]string{"alice@example.com": "203.0.113.7"}),
+			"sphinx-def456": legacyBlob(map[string]string{"alice@example.com": "198.51.100.4"}),
+			"sphinx-ghi789": legacyBlob(map[string]string{"bob@example.com": "192.0.2.9"}),
+		}))
+		st := newConfigMapStore(c, "kube-system", "sphinx-users")
+
+		if err := st.Migrate(ctx, now); err != nil {
+			t.Fatalf("Migrate: %v", err)
+		}
+		got := readStore(t, c)
+		if _, ok := got.Users["alice@example.com"]; ok {
+			t.Error("alice has conflicting CIDRs and must be dropped, forcing re-authentication")
+		}
+		if _, ok := got.Users["bob@example.com"]; !ok {
+			t.Error("bob is unambiguous and must survive")
+		}
+	})
+
+	t.Run("agreeing blobs keep the user", func(t *testing.T) {
+		c := newFakeClient(t, configMapWith(t, map[string]string{
+			"sphinx-abc123": legacyBlob(map[string]string{"alice@example.com": "203.0.113.7"}),
+			"sphinx-def456": legacyBlob(map[string]string{"alice@example.com": "203.0.113.7"}),
+		}))
+		st := newConfigMapStore(c, "kube-system", "sphinx-users")
+
+		if err := st.Migrate(ctx, now); err != nil {
+			t.Fatalf("Migrate: %v", err)
+		}
+		if got := readStore(t, c); got.Users["alice@example.com"].CIDR != "203.0.113.7/32" {
+			t.Errorf("alice CIDR = %q, want 203.0.113.7/32", got.Users["alice@example.com"].CIDR)
+		}
+	})
+
+	t.Run("skips a user with an unparseable ip", func(t *testing.T) {
+		c := newFakeClient(t, configMapWith(t, map[string]string{
+			"sphinx-abc123": legacyBlob(map[string]string{"alice@example.com": "not-an-ip"}),
+			"sphinx-def456": legacyBlob(map[string]string{"bob@example.com": "198.51.100.4"}),
+		}))
+		st := newConfigMapStore(c, "kube-system", "sphinx-users")
+
+		if err := st.Migrate(ctx, now); err != nil {
+			t.Fatalf("Migrate: %v", err)
+		}
+		got := readStore(t, c)
+		if _, ok := got.Users["alice@example.com"]; ok {
+			t.Error("alice has an unparseable ip and must be skipped")
+		}
+		if len(got.Users) != 1 {
+			t.Errorf("len(Users) = %d, want 1", len(got.Users))
+		}
+	})
+
+	t.Run("is a no-op when users.json already exists", func(t *testing.T) {
+		seed := newStore()
+		seed.upsert("alice@example.com", "203.0.113.7/32", now)
+		c := newFakeClient(t, configMapWith(t, map[string]string{
+			storeKey:        storeJSON(t, seed),
+			"sphinx-abc123": legacyBlob(map[string]string{"bob@example.com": "198.51.100.4"}),
+		}))
+		st := newConfigMapStore(c, "kube-system", "sphinx-users")
+
+		if err := st.Migrate(ctx, now); err != nil {
+			t.Fatalf("Migrate: %v", err)
+		}
+		got := readStore(t, c)
+		if _, ok := got.Users["bob@example.com"]; ok {
+			t.Error("migration must not run once users.json exists")
+		}
+	})
+
+	t.Run("is a no-op when the configmap is absent", func(t *testing.T) {
+		c := newFakeClient(t)
+		st := newConfigMapStore(c, "kube-system", "sphinx-users")
+		if err := st.Migrate(ctx, now); err != nil {
+			t.Fatalf("Migrate on absent configmap should succeed: %v", err)
+		}
+	})
+}
