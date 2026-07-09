@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/netip"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 
@@ -168,15 +170,34 @@ func resolveClientIP(c *gin.Context) string {
 	return c.ClientIP()
 }
 
+// hostCIDR converts a bare IP address into the CIDR covering only that host:
+// /32 for IPv4, /128 for IPv6.
+func hostCIDR(ip string) (string, error) {
+	addr, err := netip.ParseAddr(ip)
+	if err != nil {
+		return "", fmt.Errorf("parse ip: %w", err)
+	}
+	// An IPv4 address received over a v6 socket parses as ::ffff:a.b.c.d, whose
+	// BitLen is 128. Unmapping keeps it a /32 rather than widening it to a /128.
+	addr = addr.Unmap()
+	return netip.PrefixFrom(addr, addr.BitLen()).String(), nil
+}
+
 func getCIDRsFromUsers() []string {
-	set := make(map[string]struct{})
-	for _, v := range users {
-		set[v.IP+"/32"] = struct{}{}
+	set := make(map[string]struct{}, len(users))
+	for email, v := range users {
+		cidr, err := hostCIDR(v.IP)
+		if err != nil {
+			log.Printf("Skipping user %s with unparseable ip %q: %v", email, v.IP, err)
+			continue
+		}
+		set[cidr] = struct{}{}
 	}
 	cidrs := make([]string, 0, len(set))
 	for k := range set {
 		cidrs = append(cidrs, k)
 	}
+	sort.Strings(cidrs)
 	return cidrs
 }
 
