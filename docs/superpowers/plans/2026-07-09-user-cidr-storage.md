@@ -1302,6 +1302,35 @@ func TestAllowlistEnsureExists(t *testing.T) {
 			t.Errorf("sourceRange = %v, want untouched", got)
 		}
 	})
+
+	// Replicas starting together race to create the middleware. Losing that
+	// race is success, not a startup failure.
+	t.Run("losing the create race is not an error", func(t *testing.T) {
+		c := newFakeClient(t)
+		c.PrependReactor("create", "middlewares", func(k8stesting.Action) (bool, runtime.Object, error) {
+			return true, nil, k8serrors.NewAlreadyExists(
+				schema.GroupResource{Group: "traefik.io", Resource: "middlewares"}, "sphinx-allowlist")
+		})
+		a := newTraefikAllowlist(c, "kube-system", "sphinx-allowlist")
+
+		if err := a.EnsureExists(ctx); err != nil {
+			t.Fatalf("losing the create race must not be an error: %v", err)
+		}
+	})
+
+	t.Run("a non-conflict create failure surfaces", func(t *testing.T) {
+		c := newFakeClient(t)
+		c.PrependReactor("create", "middlewares", func(k8stesting.Action) (bool, runtime.Object, error) {
+			return true, nil, k8serrors.NewForbidden(
+				schema.GroupResource{Group: "traefik.io", Resource: "middlewares"}, "sphinx-allowlist",
+				errors.New("rbac denied"))
+		})
+		a := newTraefikAllowlist(c, "kube-system", "sphinx-allowlist")
+
+		if err := a.EnsureExists(ctx); err == nil {
+			t.Fatal("a Forbidden create must surface as an error")
+		}
+	})
 }
 ```
 
@@ -1373,6 +1402,11 @@ func (a *traefikAllowlist) EnsureExists(ctx context.Context) error {
 		"spec":       map[string]any{"ipAllowList": map[string]any{"sourceRange": []any{}}},
 	}}
 	if _, err := a.resource().Create(ctx, u, metav1.CreateOptions{}); err != nil {
+		// Replicas starting together race to create it. Losing means the
+		// middleware exists, which is all EnsureExists promises.
+		if k8serrors.IsAlreadyExists(err) {
+			return nil
+		}
 		return fmt.Errorf("create middleware: %w", err)
 	}
 	log.Printf("Created middleware %s/%s", a.namespace, a.name)
