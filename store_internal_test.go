@@ -447,4 +447,46 @@ func TestConfigMapStoreMigrate(t *testing.T) {
 			t.Fatalf("Migrate on absent configmap should succeed: %v", err)
 		}
 	})
+
+	// Every replica but one loses the migration race on the cutover rollout.
+	// Losing means the work is already done, not that startup failed.
+	t.Run("a lost migration race is not an error", func(t *testing.T) {
+		c := newFakeClient(t, configMapWith(t, map[string]string{
+			"sphinx-abc123": legacyBlob(map[string]string{"alice@example.com": "203.0.113.7"}),
+		}))
+		st := newConfigMapStore(c, "kube-system", "sphinx-users")
+
+		c.PrependReactor("update", "configmaps", func(k8stesting.Action) (bool, runtime.Object, error) {
+			// The winning replica writes users.json first. Staged through the
+			// tracker: a reactor must not call back into the client.
+			winner := newStore()
+			winner.upsert("alice@example.com", "203.0.113.7/32", now)
+			cm := configMapWith(t, map[string]string{storeKey: storeJSON(t, winner)})
+			if err := c.Tracker().Update(configMapGVR, cm, "kube-system"); err != nil {
+				t.Errorf("winner update: %v", err)
+			}
+			return true, nil, k8serrors.NewConflict(
+				schema.GroupResource{Resource: "configmaps"}, "sphinx-users", errors.New("stale"))
+		})
+
+		if err := st.Migrate(ctx, now); err != nil {
+			t.Fatalf("losing the migration race must not be an error: %v", err)
+		}
+	})
+
+	t.Run("a conflict that did not migrate still surfaces", func(t *testing.T) {
+		c := newFakeClient(t, configMapWith(t, map[string]string{
+			"sphinx-abc123": legacyBlob(map[string]string{"alice@example.com": "203.0.113.7"}),
+		}))
+		st := newConfigMapStore(c, "kube-system", "sphinx-users")
+
+		c.PrependReactor("update", "configmaps", func(k8stesting.Action) (bool, runtime.Object, error) {
+			return true, nil, k8serrors.NewConflict(
+				schema.GroupResource{Resource: "configmaps"}, "sphinx-users", errors.New("stale"))
+		})
+
+		if err := st.Migrate(ctx, now); err == nil {
+			t.Fatal("a conflict with no migrated document must surface as an error")
+		}
+	})
 }

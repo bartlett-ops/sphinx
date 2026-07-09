@@ -292,8 +292,29 @@ func (c *configMapStore) Migrate(ctx context.Context, now time.Time) error {
 		return fmt.Errorf("set data: %w", err)
 	}
 	if _, err := c.resource().Update(ctx, u, metav1.UpdateOptions{}); err != nil {
+		// Losing the migration race is the expected outcome for every replica
+		// but one. It means the work is already done, not that startup failed.
+		if k8serrors.IsConflict(err) && c.migrated(ctx) {
+			log.Printf("Migration: another replica migrated first")
+			return nil
+		}
 		return fmt.Errorf("update configmap: %w", err)
 	}
 	log.Printf("Migration: wrote %d users, removed %d legacy keys", len(s.Users), len(data))
 	return nil
+}
+
+// migrated reports whether users.json now exists, meaning another replica won
+// the migration race.
+func (c *configMapStore) migrated(ctx context.Context) bool {
+	u, err := c.get(ctx)
+	if err != nil {
+		return false
+	}
+	data, found, err := unstructured.NestedStringMap(u.Object, "data")
+	if err != nil || !found {
+		return false
+	}
+	_, ok := data[storeKey]
+	return ok
 }
