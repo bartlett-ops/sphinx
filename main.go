@@ -1,36 +1,29 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"net/http"
+	"net/netip"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
-	"sync"
+	"syscall"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/peterbourgon/ff/v3"
-	k8serrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 )
 
-type user struct {
-	Email string `json:"email"`
-	IP    string `json:"ip"`
-}
-
 var (
-	usersMu       sync.RWMutex
-	users         = make(map[string]user)
-	dynClient     *dynamic.DynamicClient
 	middlewareGVR = schema.GroupVersionResource{
 		Group:    "traefik.io",
 		Version:  "v1alpha1",
@@ -41,90 +34,124 @@ var (
 		Version:  "v1",
 		Resource: "configmaps",
 	}
-	middlewareName      *string
-	middlewareNamespace *string
-	configMapName       *string
-	instanceID          string
 )
 
 func main() {
 	port := flag.Int("port", 8080, "Port to run server on")
 	trustedProxiesRaw := flag.String("trusted-proxies", "", "Comma separated list of trusted proxies in CIDR format")
-	middlewareName = flag.String("middleware-name", "", "Name of allowlist middleware")
-	middlewareNamespace = flag.String("middleware-namespace", "kube-system", "Namespace of middleware")
-	configMapName = flag.String("configmap-name", "sphinx-users", "Name of ConfigMap for user persistence")
+	middlewareName := flag.String("middleware-name", "", "Name of allowlist middleware")
+	middlewareNamespace := flag.String("middleware-namespace", "kube-system", "Namespace of middleware")
+	configMapName := flag.String("configmap-name", "sphinx-users", "Name of ConfigMap for user persistence")
+	reconcileInterval := flag.Duration("reconcile-interval", 60*time.Second, "Background drift-repair period")
 	kubeconfig := flag.String("kubeconfig", "", "Path to kubeconfig file (auto-detected if not set)")
 	if err := ff.Parse(flag.CommandLine, os.Args[1:], ff.WithEnvVarPrefix("SPHINX")); err != nil {
 		log.Fatal(err)
 	}
 
-	var trustedProxies []string
+	if *middlewareName == "" {
+		log.Fatal("middleware-name not set")
+	}
+	if *reconcileInterval <= 0 {
+		log.Fatal("reconcile-interval must be positive")
+	}
 
+	var trustedProxies []string
 	if *trustedProxiesRaw != "" {
 		trustedProxies = strings.Split(*trustedProxiesRaw, ",")
 	}
-	if *middlewareName == "" {
-		log.Printf("Error: middleware-name not set")
-		os.Exit(1)
+	switch {
+	case len(trustedProxies) == 0:
+		log.Print("WARNING: trusted-proxies is unset, so the client IP is taken from the connection. Behind a reverse proxy every user will register the proxy's own address.")
+	case catchAllProxies(trustedProxies):
+		log.Print("WARNING: trusted-proxies trusts every address, so X-Forwarded-For is client-controlled and any caller can choose which CIDR gets allowlisted. Set it to your reverse proxy's CIDR.")
 	}
 
-	hostname, err := os.Hostname()
+	cfg, err := resolveKubeConfig(*kubeconfig)
 	if err != nil {
 		log.Fatal(err)
 	}
-	instanceID = hostname
-
-	config, err := resolveKubeConfig(*kubeconfig)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	// Create dynamic client
-	dynClient, err = dynamic.NewForConfig(config)
+	client, err := dynamic.NewForConfig(cfg)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	if _, err = getOrCreateMiddleware(middlewareName, middlewareNamespace); err != nil {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	allowlist := newTraefikAllowlist(client, *middlewareNamespace, *middlewareName)
+	if err := allowlist.EnsureExists(ctx); err != nil {
 		log.Fatal(err)
 	}
 
-	if err = loadUsers(); err != nil {
-		log.Fatal(err)
+	store := newConfigMapStore(client, *middlewareNamespace, *configMapName)
+	if err := store.Migrate(ctx, time.Now().UTC()); err != nil {
+		log.Fatalf("migrate store: %v", err)
 	}
-	log.Printf("Loaded %d users", len(users))
 
-	cidrs := getCIDRsFromUsers()
-	if err = updateMiddleware(middlewareName, middlewareNamespace, cidrs); err != nil {
-		log.Fatalf("Failed to sync middleware on startup: %v", err)
+	reconciler := newReconciler(store, allowlist)
+	// The initial reconcile prunes whatever stale CIDRs the retired
+	// append-only middleware accumulated.
+	if err := reconciler.Reconcile(ctx); err != nil {
+		log.Fatalf("initial reconcile: %v", err)
 	}
-	log.Printf("Current allowlist: %v", cidrs)
+	go reconciler.Run(ctx, *reconcileInterval)
 
 	router := gin.New()
 	router.Use(gin.LoggerWithConfig(gin.LoggerConfig{SkipPaths: []string{"/health", "/ready"}}))
 	router.Use(gin.Recovery())
-	router.SetTrustedProxies(trustedProxies)
+	if err := router.SetTrustedProxies(trustedProxies); err != nil {
+		log.Fatal(err)
+	}
 	router.GET("/health", func(c *gin.Context) { c.Status(http.StatusOK) })
-	router.GET("/ready", readiness)
-	router.GET("/users", getUsers)
-	router.POST("/users", auth) // Backwards compatibility
-	router.GET("/auth", auth)   // Backwards compatibility
+	router.GET("/ready", readiness(reconciler, allowlist, store, *reconcileInterval))
+	router.GET("/users", getUsers(store))
+	router.POST("/users", auth(reconciler)) // Backwards compatibility
+	router.GET("/auth", auth(reconciler))   // Backwards compatibility
 
-	router.Run(fmt.Sprintf(":%d", *port))
+	srv := &http.Server{Addr: fmt.Sprintf(":%d", *port), Handler: router}
+	go func() {
+		<-ctx.Done()
+		// SIGTERM: stop accepting, drain in-flight requests. Blocking in
+		// router.Run instead would serve auth traffic against a frozen
+		// reconciler until the kubelet killed us.
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("Graceful shutdown failed: %v", err)
+		}
+	}()
+	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Fatal(err)
+	}
 }
 
-func readiness(c *gin.Context) {
-	ctx := c.Request.Context()
-	if _, err := dynClient.Resource(middlewareGVR).Namespace(*middlewareNamespace).Get(ctx, *middlewareName, metav1.GetOptions{}); err != nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": fmt.Sprintf("middleware unavailable: %v", err)})
-		return
+// checker reports whether a dependency is reachable.
+type checker interface {
+	Check(ctx context.Context) error
+}
+
+// readiness requires both a recent successful reconcile and reachable
+// dependencies. The freshness check does not subsume the live reads: Healthy
+// reports on the last *successful* reconcile, so a pod whose API access breaks
+// right after one keeps reporting ready for up to 3 intervals. Together they
+// are strictly stronger than the retired probe; neither is alone.
+func readiness(r *Reconciler, allowlist, store checker, interval time.Duration) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if !r.Healthy(time.Now(), 3*interval) {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "no successful reconcile within 3 intervals"})
+			return
+		}
+		ctx := c.Request.Context()
+		if err := allowlist.Check(ctx); err != nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": fmt.Sprintf("middleware unavailable: %v", err)})
+			return
+		}
+		if err := store.Check(ctx); err != nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": fmt.Sprintf("configmap unavailable: %v", err)})
+			return
+		}
+		c.Status(http.StatusOK)
 	}
-	_, err := dynClient.Resource(configMapGVR).Namespace(*middlewareNamespace).Get(ctx, *configMapName, metav1.GetOptions{})
-	if err != nil && !k8serrors.IsNotFound(err) {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": fmt.Sprintf("configmap unavailable: %v", err)})
-		return
-	}
-	c.Status(http.StatusOK)
 }
 
 func resolveKubeConfig(override string) (*rest.Config, error) {
@@ -141,79 +168,70 @@ func resolveKubeConfig(override string) (*rest.Config, error) {
 	return clientcmd.BuildConfigFromFlags("", filepath.Join(home, ".kube", "config"))
 }
 
-func addUser(u2 user) error {
-	usersMu.Lock()
-	u1, exists := users[u2.Email]
-	if exists && u1 == u2 {
-		usersMu.Unlock()
-		return nil
-	}
-	users[u2.Email] = u2
-	cidrs := getCIDRsFromUsers()
-	usersMu.Unlock()
-
-	if err := saveUsers(); err != nil {
-		return err
-	}
-	return updateMiddleware(middlewareName, middlewareNamespace, cidrs)
-}
-
-func resolveClientIP(c *gin.Context) string {
-	if xff := c.GetHeader("X-Forwarded-For"); xff != "" {
-		if i := strings.IndexByte(xff, ','); i != -1 {
-			return strings.TrimSpace(xff[:i])
-		}
-		return strings.TrimSpace(xff)
-	}
-	return c.ClientIP()
-}
-
-func getCIDRsFromUsers() []string {
-	set := make(map[string]struct{})
-	for _, v := range users {
-		set[v.IP+"/32"] = struct{}{}
-	}
-	cidrs := make([]string, 0, len(set))
-	for k := range set {
-		cidrs = append(cidrs, k)
-	}
-	return cidrs
-}
-
-func getUnstructured(middleware *Middleware) (*unstructured.Unstructured, error) {
-	obj, err := runtime.DefaultUnstructuredConverter.ToUnstructured(middleware)
+// hostCIDR converts a bare IP address into the CIDR covering only that host:
+// /32 for IPv4, /128 for IPv6.
+func hostCIDR(ip string) (string, error) {
+	addr, err := netip.ParseAddr(ip)
 	if err != nil {
-		log.Printf("conversion failed: %v", err)
+		return "", fmt.Errorf("parse ip: %w", err)
 	}
-	return &unstructured.Unstructured{Object: obj}, err
+	// An IPv4 address received over a v6 socket parses as ::ffff:a.b.c.d, whose
+	// BitLen is 128. Unmapping keeps it a /32 rather than widening it to a /128.
+	addr = addr.Unmap()
+	return netip.PrefixFrom(addr, addr.BitLen()).String(), nil
 }
 
-func getUsers(c *gin.Context) {
-	usersMu.RLock()
-	defer usersMu.RUnlock()
-	c.IndentedJSON(http.StatusOK, users)
+// catchAllProxies reports whether the trusted-proxy set trusts every address.
+// Gin then walks X-Forwarded-For to its leftmost entry, which any caller can
+// set, so the allowlisted CIDR becomes client-controlled.
+func catchAllProxies(cidrs []string) bool {
+	for _, c := range cidrs {
+		switch strings.TrimSpace(c) {
+		case "0.0.0.0/0", "::/0":
+			return true
+		}
+	}
+	return false
 }
 
-func auth(c *gin.Context) {
-	email := c.GetHeader("X-Forwarded-User")
-	if email == "" {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": "Missing X-Forwarded-User header",
-		})
-		return
+func getUsers(store UserStore) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		s, err := store.Load(c.Request.Context())
+		if err != nil {
+			log.Printf("Failed to load users: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load users"})
+			return
+		}
+		c.IndentedJSON(http.StatusOK, s.Users)
 	}
-	user := user{
-		Email: email,
-		IP:    resolveClientIP(c),
-	}
+}
 
-	if err := addUser(user); err != nil {
-		log.Println("Failed to add user")
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": "Failed to add user",
-		})
-		return
+func auth(r *Reconciler) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		email := c.GetHeader("X-Forwarded-User")
+		if email == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Missing X-Forwarded-User header"})
+			return
+		}
+		cidr, err := hostCIDR(c.ClientIP())
+		if err != nil {
+			log.Printf("Failed to resolve client ip for %s: %v", email, err)
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Unresolvable client IP"})
+			return
+		}
+
+		wrote, err := r.Authenticate(c.Request.Context(), email, cidr)
+		if err != nil {
+			log.Printf("Failed to add user %s: %v", email, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to add user"})
+			return
+		}
+
+		status := http.StatusOK
+		if wrote {
+			status = http.StatusCreated
+			log.Printf("Registered %s at %s", email, cidr)
+		}
+		c.IndentedJSON(status, gin.H{"email": email, "cidr": cidr})
 	}
-	log.Println("Added user")
-	c.IndentedJSON(http.StatusCreated, user)
 }
